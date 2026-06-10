@@ -1,0 +1,38 @@
+{
+  "name": "rio-mobility-assistant-api",
+  "version": "0.1.0",
+  "description": "Backend em Node/TypeScript para assistente de viagens urbanas e controle de gastos com transporte na cidade do Rio de Janeiro (projeto 5PDM).",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "ts-node-dev --respawn --transpile-only src/index.ts"
+  },
+  "keywords": [
+    "node",
+    "typescript",
+    "express",
+    "mobility",
+    "rio-de-janeiro",
+    "gtfs",
+    "supabase"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "cors": "^2.8.5",
+    "csv-parse": "^6.2.1",
+    "dotenv": "^16.6.1",
+    "express": "^4.19.0",
+    "node-fetch": "^2.7.0",
+    "pg": "^8.21.0"
+  },
+  "devDependencies": {
+    "@types/dotenv": "^6.1.1",
+    "@types/express": "^4.17.21",
+    "@types/node": "^20.11.0",
+    "@types/node-fetch": "^2.6.13",
+    "ts-node-dev": "^2.0.0",
+    "typescript": "^5.4.0"
+  }
+}
