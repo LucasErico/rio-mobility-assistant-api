@@ -1,9 +1,9 @@
 import * as path from 'path';
-const dotenv = require('dotenv');
+import * as dotenv from 'dotenv';
 dotenv.config({ path: path.resolve(__dirname, '../.env') });
 
-import * as express from 'express';
-import * as cors from 'cors';
+import express, { Request, Response } from 'express';
+import cors from 'cors';
 import { pool } from './db';
 import routeRouter from './routes/route';
 
@@ -13,15 +13,16 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 
-app.get('/health', (_req, res) => {
+app.get('/health', (_req: Request, res: Response) => {
   res.json({ status: 'ok', message: 'Rio Mobility Assistant API up and running' });
 });
 
 // Journeys (histórico)
-app.post('/journeys', async (req, res) => {
+app.post('/journeys', async (req: Request, res: Response) => {
   const { origin, destination, preferred_modes } = req.body || {};
   if (!origin || !destination) {
-    return res.status(400).json({ error: 'origin and destination are required' });
+    res.status(400).json({ error: 'origin and destination are required' });
+    return;
   }
   try {
     const result = await pool.query(
@@ -36,7 +37,7 @@ app.post('/journeys', async (req, res) => {
   }
 });
 
-app.get('/journeys', async (_req, res) => {
+app.get('/journeys', async (_req: Request, res: Response) => {
   try {
     const result = await pool.query(`select * from journeys order by created_at desc`);
     res.json(result.rows);
