@@ -1,10 +1,11 @@
 import * as path from 'path';
-import * as dotenv from 'dotenv';
+const dotenv = require('dotenv');
 dotenv.config({ path: path.resolve(__dirname, '../.env') });
 
 import * as express from 'express';
 import * as cors from 'cors';
 import { pool } from './db';
+import routeRouter from './routes/route';
 
 const app = express();
 app.use(cors());
@@ -16,21 +17,18 @@ app.get('/health', (_req, res) => {
   res.json({ status: 'ok', message: 'Rio Mobility Assistant API up and running' });
 });
 
+// Journeys (histórico)
 app.post('/journeys', async (req, res) => {
   const { origin, destination, preferred_modes } = req.body || {};
-
   if (!origin || !destination) {
     return res.status(400).json({ error: 'origin and destination are required' });
   }
-
   try {
     const result = await pool.query(
       `insert into journeys (origin_lat, origin_lon, destination_lat, destination_lon, preferred_modes)
-       values ($1, $2, $3, $4, $5)
-       returning *`,
+       values ($1, $2, $3, $4, $5) returning *`,
       [origin.lat, origin.lon, destination.lat, destination.lon, preferred_modes || []]
     );
-
     res.status(201).json(result.rows[0]);
   } catch (err) {
     console.error('Error inserting journey', err);
@@ -40,14 +38,15 @@ app.post('/journeys', async (req, res) => {
 
 app.get('/journeys', async (_req, res) => {
   try {
-    const result = await pool.query(
-      `select * from journeys order by created_at desc`
-    );
+    const result = await pool.query(`select * from journeys order by created_at desc`);
     res.json(result.rows);
   } catch (err) {
     console.error('Error fetching journeys', err);
     res.status(500).json({ error: 'Database error' });
   }
 });
+
+// Roteamento principal
+app.use('/api/route', routeRouter);
 
 app.listen(PORT, () => { console.log(`Server listening on port ${PORT}`); });
