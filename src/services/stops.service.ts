@@ -11,12 +11,12 @@ export interface NearbyStop {
   distance_m: number;
 }
 
-const SEARCH_RADIUS_M = 600;
+const SEARCH_RADIUS_M = 1000;
 
 export async function getNearbyStops(lat: number, lng: number): Promise<NearbyStop[]> {
   const results: NearbyStop[] = [];
 
-  // GTFS bus stops
+  // GTFS bus/BRT — raio 1000m, limite 40 para pegar tanto BRT quanto ônibus municipal
   const busResult = await pool.query(`
     SELECT
       stop_id   AS id,
@@ -35,18 +35,18 @@ export async function getNearbyStops(lat: number, lng: number): Promise<NearbySt
       $3
     )
     ORDER BY distance_m
-    LIMIT 20
+    LIMIT 40
   `, [lat, lng, SEARCH_RADIUS_M]);
   results.push(...busResult.rows);
 
-  // Metro stations — usa is_active (coluna real da tabela metro_stations)
+  // Metro stations
   const metroResult = await pool.query(`
     SELECT
-      id::text AS id,
+      id::text                  AS id,
       name,
-      ST_Y(geom::geometry) AS lat,
-      ST_X(geom::geometry) AS lng,
-      'metro' AS modal,
+      ST_Y(geom::geometry)      AS lat,
+      ST_X(geom::geometry)      AS lng,
+      'metro'                   AS modal,
       ROUND(ST_Distance(
         geom::geography,
         ST_SetSRID(ST_MakePoint($2, $1), 4326)::geography
@@ -59,18 +59,18 @@ export async function getNearbyStops(lat: number, lng: number): Promise<NearbySt
         $3
       )
     ORDER BY distance_m
-    LIMIT 5
+    LIMIT 10
   `, [lat, lng, SEARCH_RADIUS_M]);
   results.push(...metroResult.rows);
 
-  // Train stations — sem filtro de status (coluna não existe na tabela)
+  // Train stations
   const trainResult = await pool.query(`
     SELECT
-      id::text AS id,
+      id::text                  AS id,
       name,
-      ST_Y(geom::geometry) AS lat,
-      ST_X(geom::geometry) AS lng,
-      'train' AS modal,
+      ST_Y(geom::geometry)      AS lat,
+      ST_X(geom::geometry)      AS lng,
+      'train'                   AS modal,
       ROUND(ST_Distance(
         geom::geography,
         ST_SetSRID(ST_MakePoint($2, $1), 4326)::geography
@@ -82,18 +82,18 @@ export async function getNearbyStops(lat: number, lng: number): Promise<NearbySt
       $3
     )
     ORDER BY distance_m
-    LIMIT 5
+    LIMIT 10
   `, [lat, lng, SEARCH_RADIUS_M]);
   results.push(...trainResult.rows);
 
-  // VLT stops — in_operation existe na tabela, sem alteração
+  // VLT stops — colunas: id, siurb_id, name, line_name, geom
   const vltResult = await pool.query(`
     SELECT
-      id::text AS id,
+      id::text                  AS id,
       name,
-      ST_Y(geom::geometry) AS lat,
-      ST_X(geom::geometry) AS lng,
-      'vlt' AS modal,
+      ST_Y(geom::geometry)      AS lat,
+      ST_X(geom::geometry)      AS lng,
+      'vlt'                     AS modal,
       ROUND(ST_Distance(
         geom::geography,
         ST_SetSRID(ST_MakePoint($2, $1), 4326)::geography
@@ -105,7 +105,7 @@ export async function getNearbyStops(lat: number, lng: number): Promise<NearbySt
       $3
     )
     ORDER BY distance_m
-    LIMIT 5
+    LIMIT 10
   `, [lat, lng, SEARCH_RADIUS_M]);
   results.push(...vltResult.rows);
 
