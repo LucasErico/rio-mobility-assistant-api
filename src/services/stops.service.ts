@@ -39,7 +39,7 @@ export async function getNearbyStops(lat: number, lng: number): Promise<NearbySt
   `, [lat, lng, SEARCH_RADIUS_M]);
   results.push(...busResult.rows);
 
-  // Metro stations
+  // Metro stations — usa is_active (coluna real da tabela metro_stations)
   const metroResult = await pool.query(`
     SELECT
       id::text AS id,
@@ -52,7 +52,7 @@ export async function getNearbyStops(lat: number, lng: number): Promise<NearbySt
         ST_SetSRID(ST_MakePoint($2, $1), 4326)::geography
       ))::int AS distance_m
     FROM metro_stations
-    WHERE in_operation = true
+    WHERE (is_active = true OR is_active IS NULL)
       AND ST_DWithin(
         geom::geography,
         ST_SetSRID(ST_MakePoint($2, $1), 4326)::geography,
@@ -63,7 +63,7 @@ export async function getNearbyStops(lat: number, lng: number): Promise<NearbySt
   `, [lat, lng, SEARCH_RADIUS_M]);
   results.push(...metroResult.rows);
 
-  // Train stations
+  // Train stations — sem filtro de status (coluna não existe na tabela)
   const trainResult = await pool.query(`
     SELECT
       id::text AS id,
@@ -86,7 +86,7 @@ export async function getNearbyStops(lat: number, lng: number): Promise<NearbySt
   `, [lat, lng, SEARCH_RADIUS_M]);
   results.push(...trainResult.rows);
 
-  // VLT stops
+  // VLT stops — in_operation existe na tabela, sem alteração
   const vltResult = await pool.query(`
     SELECT
       id::text AS id,
