@@ -24,8 +24,7 @@ export interface RouteOption {
   };
 }
 
-// Tarifas 2026 corrigidas
-// bus/brt/vlt: R$ 5,00 | metro: R$ 7,90 (tarifa cheia Jaé) | train: R$ 7,60 (tarifa cheia Riocard)
+// Tarifas 2026 (bus/brt/vlt: R$5,00 | metro: R$7,90 | train: R$7,60)
 const MODAL_FARE: Record<string, number> = {
   bus:   5.00,
   metro: 7.90,
@@ -34,17 +33,16 @@ const MODAL_FARE: Record<string, number> = {
   brt:   5.00,
 };
 
-// Velocidade média em metros por minuto por modal
 const MODAL_SPEED_M_PER_MIN: Record<string, number> = {
-  bus:   250,  // ~15 km/h considerando paradas
-  brt:   400,  // ~24 km/h corredor exclusivo
-  metro: 500,  // ~30 km/h
+  bus:   250,
+  brt:   400,
+  metro: 500,
   train: 500,
   vlt:   300,
 };
 
-const WALK_SPEED_M_PER_MIN = 80;   // ~5 km/h
-const WALK_TRANSFER_MAX_M  = 400;  // caminhada máxima para baldeação a pé
+const WALK_SPEED_M_PER_MIN = 80;
+const WALK_TRANSFER_MAX_M  = 400;
 const MAX_TRANSFERS        = 3;
 
 function walkMinutes(meters: number): number {
@@ -60,56 +58,87 @@ function haversineM(lat1: number, lng1: number, lat2: number, lng2: number): num
   return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
-// ─── Shape real da trip ───────────────────────────────────────────────────────
+// ─── Shape real da trip via ST_LineLocatePoint ────────────────────────────────
+// Usa a posição geográfica das paradas para localizar o trecho exato no shape.
+// Elimina a estimativa proporcional por stop_sequence que cortava o shape cedo.
 async function getShapeForTrip(
   tripId: string,
   fromStopId: string,
   toStopId: string
 ): Promise<{ lat: number; lng: number }[]> {
   try {
-    // Pega shape_id e sequências das paradas
-    const tripRes = await pool.query(
-      `SELECT t.shape_id, st.stop_sequence, st.stop_id
+    // 1. Busca shape_id e coordenadas das duas paradas
+    const stopsRes = await pool.query(
+      `SELECT t.shape_id,
+              s.stop_id,
+              ST_Y(s.geom::geometry) AS lat,
+              ST_X(s.geom::geometry) AS lng
        FROM gtfs_trips t
        JOIN gtfs_stop_times st ON st.trip_id = t.trip_id
-       WHERE t.trip_id = $1 AND st.stop_id = ANY($2)
-       ORDER BY st.stop_sequence`,
+       JOIN gtfs_stops s ON s.stop_id = st.stop_id
+       WHERE t.trip_id = $1 AND st.stop_id = ANY($2)`,
       [tripId, [fromStopId, toStopId]]
     );
 
-    if (!tripRes.rows.length || !tripRes.rows[0].shape_id) return [];
+    if (!stopsRes.rows.length || !stopsRes.rows[0].shape_id) return [];
 
-    const shapeId = tripRes.rows[0].shape_id;
-    const seqFrom = tripRes.rows.find((r: any) => r.stop_id === fromStopId)?.stop_sequence ?? 0;
-    const seqTo   = tripRes.rows.find((r: any) => r.stop_id === toStopId)?.stop_sequence ?? 999999;
+    const shapeId  = stopsRes.rows[0].shape_id;
+    const fromRow  = stopsRes.rows.find((r: any) => r.stop_id === fromStopId);
+    const toRow    = stopsRes.rows.find((r: any) => r.stop_id === toStopId);
 
-    // Estima faixa de shape_pt_sequence proporcional
-    const totalSeqRes = await pool.query(
-      `SELECT MIN(shape_pt_sequence) AS mn, MAX(shape_pt_sequence) AS mx,
-              COUNT(*)::int AS total
-       FROM gtfs_shapes WHERE shape_id = $1`,
-      [shapeId]
+    if (!fromRow || !toRow) return [];
+
+    // 2. Constrói a linha completa do shape e usa ST_LineLocatePoint
+    //    para encontrar as frações 0..1 de onde cada parada cai no shape
+    const fractionsRes = await pool.query(
+      `WITH shape_line AS (
+         SELECT ST_MakeLine(
+           ST_SetSRID(ST_MakePoint(shape_pt_lon, shape_pt_lat), 4326)
+           ORDER BY shape_pt_sequence
+         ) AS line
+         FROM gtfs_shapes
+         WHERE shape_id = $1
+       )
+       SELECT
+         ST_LineLocatePoint(line, ST_SetSRID(ST_MakePoint($3, $2), 4326)) AS frac_from,
+         ST_LineLocatePoint(line, ST_SetSRID(ST_MakePoint($5, $4), 4326)) AS frac_to
+       FROM shape_line`,
+      [shapeId, fromRow.lat, fromRow.lng, toRow.lat, toRow.lng]
     );
-    const { mn, mx } = totalSeqRes.rows[0];
 
-    // Busca sequência total de paradas da trip
-    const totalStopsRes = await pool.query(
-      `SELECT MAX(stop_sequence) AS max_seq FROM gtfs_stop_times WHERE trip_id = $1`,
-      [tripId]
-    );
-    const maxStopSeq = totalStopsRes.rows[0]?.max_seq ?? 100;
+    if (!fractionsRes.rows.length) return [];
 
-    const shapePtFrom = Math.floor(mn + (seqFrom / maxStopSeq) * (mx - mn));
-    const shapePtTo   = Math.ceil (mn + (seqTo   / maxStopSeq) * (mx - mn));
+    let { frac_from, frac_to } = fractionsRes.rows[0];
 
+    // Garante ordem correta (em linhas circulares frac_from pode ser > frac_to)
+    if (frac_from > frac_to) [frac_from, frac_to] = [frac_to, frac_from];
+
+    // 3. Extrai os pontos do shape dentro do intervalo de frações
+    //    Usa a mesma shape_line para filtrar por posição relativa
     const shapeRes = await pool.query(
-      `SELECT shape_pt_lat AS lat, shape_pt_lon AS lng
-       FROM gtfs_shapes
-       WHERE shape_id = $1
-         AND shape_pt_sequence BETWEEN $2 AND $3
-       ORDER BY shape_pt_sequence
-       LIMIT 200`,
-      [shapeId, shapePtFrom, shapePtTo]
+      `WITH shape_line AS (
+         SELECT ST_MakeLine(
+           ST_SetSRID(ST_MakePoint(shape_pt_lon, shape_pt_lat), 4326)
+           ORDER BY shape_pt_sequence
+         ) AS line,
+         MIN(shape_pt_sequence) AS min_seq,
+         MAX(shape_pt_sequence) AS max_seq
+         FROM gtfs_shapes
+         WHERE shape_id = $1
+       )
+       SELECT
+         shape_pt_lat AS lat,
+         shape_pt_lon AS lng,
+         shape_pt_sequence
+       FROM gtfs_shapes gs, shape_line sl
+       WHERE gs.shape_id = $1
+         AND ST_LineLocatePoint(
+               sl.line,
+               ST_SetSRID(ST_MakePoint(gs.shape_pt_lon, gs.shape_pt_lat), 4326)
+             ) BETWEEN $2 AND $3
+       ORDER BY gs.shape_pt_sequence
+       LIMIT 250`,
+      [shapeId, frac_from, frac_to]
     );
 
     return shapeRes.rows.map((r: any) => ({ lat: Number(r.lat), lng: Number(r.lng) }));
@@ -118,8 +147,7 @@ async function getShapeForTrip(
   }
 }
 
-// ─── Trips que saem de um stop e chegam em qualquer stop de um conjunto ───────
-// Cache por request: evita queries repetidas para o mesmo stopId dentro do mesmo BFS
+// ─── Trips que saem de um stop ────────────────────────────────────────────────
 async function getTripsFromStop(
   stopId: string,
   candidateDestStopIds: string[],
@@ -135,7 +163,6 @@ async function getTripsFromStop(
 }[]> {
   if (candidateDestStopIds.length === 0) return [];
 
-  // Chave de cache: stopId + destinos ordenados
   const cacheKey = stopId + '|' + [...candidateDestStopIds].sort().join(',');
   if (cache.has(cacheKey)) return cache.get(cacheKey)!;
 
@@ -172,8 +199,7 @@ async function getTripsFromStop(
   return res.rows;
 }
 
-// Tempo de espera + viagem para uma trip
-// Cache por request: evita queries repetidas para o mesmo tripId
+// ─── Estimativa de tempo de viagem ────────────────────────────────────────────
 async function estimateTravelMinutes(
   tripId: string,
   stopCount: number,
@@ -182,7 +208,6 @@ async function estimateTravelMinutes(
   toStopId: string,
   freqCache: Map<string, number>
 ): Promise<number> {
-  // Distância real entre as paradas via coordenadas
   let distM = 0;
   try {
     const distRes = await pool.query(
@@ -195,14 +220,13 @@ async function estimateTravelMinutes(
       [fromStopId, toStopId]
     );
     distM = distRes.rows[0]?.dist_m ?? 0;
-  } catch { /* usa fallback */ }
+  } catch { /* fallback */ }
 
   const speed     = MODAL_SPEED_M_PER_MIN[modal] ?? 250;
   const travelMin = distM > 0
     ? Math.ceil(distM / speed)
     : stopCount * (modal === 'brt' ? 1.5 : 2);
 
-  // Tempo de espera via headway — cache para evitar query repetida por tripId
   let waitMin = 12;
   if (freqCache.has(tripId)) {
     waitMin = freqCache.get(tripId)!;
@@ -220,32 +244,27 @@ async function estimateTravelMinutes(
   return waitMin + travelMin;
 }
 
-// ─── Estrutura de nó do BFS ───────────────────────────────────────────────────
+// ─── BFS ──────────────────────────────────────────────────────────────────────
 interface BfsNode {
-  stopId:   string;
-  stop:     NearbyStop;
-  legs:     RouteLeg[];
-  totalMin: number;
+  stopId:    string;
+  stop:      NearbyStop;
+  legs:      RouteLeg[];
+  totalMin:  number;
   totalCost: number;
   transfers: number;
 }
 
-// ─── BFS principal ────────────────────────────────────────────────────────────
 async function bfsRoutes(
   originStops: NearbyStop[],
   destStops:   NearbyStop[],
   priority:    Priority
 ): Promise<RouteOption[]> {
-  const destStopIds  = new Set(destStops.map(s => s.id));
-  const destStopMap  = new Map(destStops.map(s => [s.id, s]));
-  const foundRoutes: RouteOption[] = [];
+  const destStopMap      = new Map(destStops.map(s => [s.id, s]));
+  const foundRoutes:     RouteOption[] = [];
   const seenFingerprints = new Set<string>();
+  const tripsCache:      Map<string, any[]>  = new Map();
+  const freqCache:       Map<string, number> = new Map();
 
-  // Caches por request — eliminam queries repetidas durante o BFS
-  const tripsCache: Map<string, any[]> = new Map();
-  const freqCache:  Map<string, number> = new Map();
-
-  // Fila BFS: começa com todos os stops de origem
   let queue: BfsNode[] = originStops.map(s => ({
     stopId:    s.id,
     stop:      s,
@@ -255,7 +274,7 @@ async function bfsRoutes(
     transfers: 0,
   }));
 
-  const visited = new Map<string, number>(); // stopId → melhor totalMin
+  const visited = new Map<string, number>();
 
   while (queue.length > 0) {
     const nextQueue: BfsNode[] = [];
@@ -265,43 +284,39 @@ async function bfsRoutes(
 
       const nearDestIds = destStops.map(s => s.id);
 
-      // Chegada a pé ao destino a partir deste nó
+      // Chegada a pé
       const walkableDestIds = destStops
         .filter(ds => haversineM(node.stop.lat, node.stop.lng, ds.lat, ds.lng) <= WALK_TRANSFER_MAX_M)
         .map(ds => ds.id);
 
       if (walkableDestIds.length > 0) {
         for (const dId of walkableDestIds) {
-          const ds = destStopMap.get(dId)!;
+          const ds    = destStopMap.get(dId)!;
           const walkM = haversineM(node.stop.lat, node.stop.lng, ds.lat, ds.lng);
-          const route: RouteOption = {
-            legs: node.legs,
-            summary: {
-              total_minutes:      node.totalMin + walkMinutes(walkM),
-              transfers:          Math.max(0, node.legs.length - 1), // corrigido: transfers = legs - 1
-              estimated_cost_brl: node.totalCost,
-            },
-          };
-          const fp = node.legs.map(l => l.route_name + l.from_stop).join('|');
+          const fp    = node.legs.map(l => l.route_name + l.from_stop).join('|');
           if (!seenFingerprints.has(fp)) {
             seenFingerprints.add(fp);
-            foundRoutes.push(route);
+            foundRoutes.push({
+              legs: node.legs,
+              summary: {
+                total_minutes:      node.totalMin + walkMinutes(walkM),
+                transfers:          Math.max(0, node.legs.length - 1),
+                estimated_cost_brl: node.totalCost,
+              },
+            });
           }
         }
       }
 
-      // Trips diretas para stops de destino
+      // Trips diretas
       const trips = await getTripsFromStop(node.stopId, nearDestIds, tripsCache);
-
       for (const trip of trips.slice(0, 5)) {
         const destStop  = destStopMap.get(trip.dest_stop_id)!;
         const travelMin = await estimateTravelMinutes(
           trip.trip_id, trip.stop_count, trip.modal,
-          node.stopId, trip.dest_stop_id,
-          freqCache
+          node.stopId, trip.dest_stop_id, freqCache
         );
         const shapeCoords = await getShapeForTrip(trip.trip_id, node.stopId, trip.dest_stop_id);
-        const walkDest    = walkMinutes(destStop.distance_m);
         const fare        = MODAL_FARE[trip.modal] ?? MODAL_FARE.bus;
 
         const leg: RouteLeg = {
@@ -317,21 +332,23 @@ async function bfsRoutes(
         };
 
         const newLegs  = [...node.legs, leg];
-        const newMin   = node.totalMin + travelMin + walkDest;
+        const newMin   = node.totalMin + travelMin + walkMinutes(destStop.distance_m);
         const newCost  = node.totalCost + fare;
-        const newTrans = Math.max(0, newLegs.length - 1); // corrigido: transfers = legs - 1
-
-        const fp = newLegs.map(l => l.route_name + l.from_stop).join('|');
+        const fp       = newLegs.map(l => l.route_name + l.from_stop).join('|');
         if (!seenFingerprints.has(fp)) {
           seenFingerprints.add(fp);
           foundRoutes.push({
             legs: newLegs,
-            summary: { total_minutes: newMin, transfers: newTrans, estimated_cost_brl: newCost },
+            summary: {
+              total_minutes:      newMin,
+              transfers:          Math.max(0, newLegs.length - 1),
+              estimated_cost_brl: newCost,
+            },
           });
         }
       }
 
-      // Expansão BFS para próxima camada (baldeações)
+      // Expansão para próxima camada
       if (node.transfers < MAX_TRANSFERS) {
         const intermediateStops = await getNearbyStopsAlongRoute(
           node.stop.lat, node.stop.lng,
@@ -341,38 +358,34 @@ async function bfsRoutes(
 
         for (const interStop of intermediateStops.slice(0, 8)) {
           if (interStop.id === node.stopId) continue;
-          const prevBest = visited.get(interStop.id) ?? Infinity;
+          const prevBest   = visited.get(interStop.id) ?? Infinity;
           const interTrips = await getTripsFromStop(node.stopId, [interStop.id], tripsCache);
           if (interTrips.length === 0) continue;
 
           const interTrip   = interTrips[0];
           const interMin    = await estimateTravelMinutes(
             interTrip.trip_id, interTrip.stop_count, interTrip.modal,
-            node.stopId, interStop.id,
-            freqCache
+            node.stopId, interStop.id, freqCache
           );
-          const interShape  = await getShapeForTrip(interTrip.trip_id, node.stopId, interStop.id);
           const newTotalMin = node.totalMin + interMin;
-
           if (newTotalMin >= prevBest) continue;
           visited.set(interStop.id, newTotalMin);
 
-          const interLeg: RouteLeg = {
-            modal:             interTrip.modal,
-            route_name:        interTrip.route_name,
-            from_stop:         node.stop.name,
-            to_stop:           interStop.name,
-            from_coords:       { lat: node.stop.lat,  lng: node.stop.lng  },
-            to_coords:         { lat: interStop.lat,  lng: interStop.lng  },
-            shape_coords:      interShape,
-            estimated_minutes: interMin,
-            walk_to_stop_m:    node.stop.distance_m,
-          };
-
+          const interShape = await getShapeForTrip(interTrip.trip_id, node.stopId, interStop.id);
           nextQueue.push({
             stopId:    interStop.id,
             stop:      interStop,
-            legs:      [...node.legs, interLeg],
+            legs:      [...node.legs, {
+              modal:             interTrip.modal,
+              route_name:        interTrip.route_name,
+              from_stop:         node.stop.name,
+              to_stop:           interStop.name,
+              from_coords:       { lat: node.stop.lat,  lng: node.stop.lng  },
+              to_coords:         { lat: interStop.lat,  lng: interStop.lng  },
+              shape_coords:      interShape,
+              estimated_minutes: interMin,
+              walk_to_stop_m:    node.stop.distance_m,
+            }],
             totalMin:  newTotalMin,
             totalCost: node.totalCost + (MODAL_FARE[interTrip.modal] ?? MODAL_FARE.bus),
             transfers: node.transfers + 1,
@@ -388,13 +401,12 @@ async function bfsRoutes(
   return foundRoutes;
 }
 
-// Busca paradas intermediárias ao longo do vetor origem→destino
 async function getNearbyStopsAlongRoute(
   originLat: number, originLng: number,
   destLat:   number, destLng:   number
 ): Promise<NearbyStop[]> {
-  const midLat = (originLat + destLat) / 2;
-  const midLng = (originLng + destLng) / 2;
+  const midLat    = (originLat + destLat) / 2;
+  const midLng    = (originLng + destLng) / 2;
   const totalDist = haversineM(originLat, originLng, destLat, destLng);
   const radius    = Math.max(totalDist / 2, 1000);
 
@@ -438,8 +450,8 @@ export async function calculateRoutes(
   priority:  Priority
 ): Promise<RouteOption[]> {
   const [originStops, destStops] = await Promise.all([
-    getNearbyStops(originLat, originLng),
-    getNearbyStops(destLat,   destLng),
+    getNearbyStops(originLat, originLng, false),  // origem: LIMIT 40
+    getNearbyStops(destLat,   destLng,   true),   // destino: LIMIT 60
   ]);
 
   if (originStops.length === 0 || destStops.length === 0) {
