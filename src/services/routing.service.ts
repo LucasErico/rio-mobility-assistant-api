@@ -24,12 +24,14 @@ export interface RouteOption {
   };
 }
 
+// Tarifas 2026 corrigidas
+// bus/brt/vlt: R$ 5,00 | metro: R$ 7,90 (tarifa cheia Jaé) | train: R$ 7,60 (tarifa cheia Riocard)
 const MODAL_FARE: Record<string, number> = {
-  bus:   4.05,
-  metro: 5.70,
-  train: 2.20,
-  vlt:   0.00,
-  brt:   4.05,
+  bus:   5.00,
+  metro: 7.90,
+  train: 7.60,
+  vlt:   5.00,
+  brt:   5.00,
 };
 
 // Velocidade média em metros por minuto por modal
@@ -88,7 +90,7 @@ async function getShapeForTrip(
        FROM gtfs_shapes WHERE shape_id = $1`,
       [shapeId]
     );
-    const { mn, mx, total } = totalSeqRes.rows[0];
+    const { mn, mx } = totalSeqRes.rows[0];
 
     // Busca sequência total de paradas da trip
     const totalStopsRes = await pool.query(
@@ -117,9 +119,11 @@ async function getShapeForTrip(
 }
 
 // ─── Trips que saem de um stop e chegam em qualquer stop de um conjunto ───────
+// Cache por request: evita queries repetidas para o mesmo stopId dentro do mesmo BFS
 async function getTripsFromStop(
   stopId: string,
-  candidateDestStopIds: string[]
+  candidateDestStopIds: string[],
+  cache: Map<string, any[]>
 ): Promise<{
   trip_id: string;
   route_name: string;
@@ -130,6 +134,11 @@ async function getTripsFromStop(
   to_seq: number;
 }[]> {
   if (candidateDestStopIds.length === 0) return [];
+
+  // Chave de cache: stopId + destinos ordenados
+  const cacheKey = stopId + '|' + [...candidateDestStopIds].sort().join(',');
+  if (cache.has(cacheKey)) return cache.get(cacheKey)!;
+
   const res = await pool.query(
     `SELECT
        st1.trip_id,
@@ -158,16 +167,20 @@ async function getTripsFromStop(
      LIMIT 30`,
     [stopId, candidateDestStopIds]
   );
+
+  cache.set(cacheKey, res.rows);
   return res.rows;
 }
 
 // Tempo de espera + viagem para uma trip
+// Cache por request: evita queries repetidas para o mesmo tripId
 async function estimateTravelMinutes(
   tripId: string,
   stopCount: number,
   modal: string,
   fromStopId: string,
-  toStopId: string
+  toStopId: string,
+  freqCache: Map<string, number>
 ): Promise<number> {
   // Distância real entre as paradas via coordenadas
   let distM = 0;
@@ -189,14 +202,20 @@ async function estimateTravelMinutes(
     ? Math.ceil(distM / speed)
     : stopCount * (modal === 'brt' ? 1.5 : 2);
 
-  // Tempo de espera: usa headway se disponível
-  const freq = await pool.query(
-    `SELECT headway_secs FROM gtfs_frequencies WHERE trip_id = $1 LIMIT 1`,
-    [tripId]
-  );
-  const waitMin = freq.rows.length > 0
-    ? Math.ceil(freq.rows[0].headway_secs / 60 / 2)
-    : 12;
+  // Tempo de espera via headway — cache para evitar query repetida por tripId
+  let waitMin = 12;
+  if (freqCache.has(tripId)) {
+    waitMin = freqCache.get(tripId)!;
+  } else {
+    const freq = await pool.query(
+      `SELECT headway_secs FROM gtfs_frequencies WHERE trip_id = $1 LIMIT 1`,
+      [tripId]
+    );
+    waitMin = freq.rows.length > 0
+      ? Math.ceil(freq.rows[0].headway_secs / 60 / 2)
+      : 12;
+    freqCache.set(tripId, waitMin);
+  }
 
   return waitMin + travelMin;
 }
@@ -222,6 +241,10 @@ async function bfsRoutes(
   const foundRoutes: RouteOption[] = [];
   const seenFingerprints = new Set<string>();
 
+  // Caches por request — eliminam queries repetidas durante o BFS
+  const tripsCache: Map<string, any[]> = new Map();
+  const freqCache:  Map<string, number> = new Map();
+
   // Fila BFS: começa com todos os stops de origem
   let queue: BfsNode[] = originStops.map(s => ({
     stopId:    s.id,
@@ -240,25 +263,22 @@ async function bfsRoutes(
     for (const node of queue) {
       if (node.transfers > MAX_TRANSFERS) continue;
 
-      // Busca todas as trips saindo desse stop para qualquer stop do destino
-      // ou para qualquer stop visitável (para continuar o BFS)
       const nearDestIds = destStops.map(s => s.id);
 
-      // Também considera paradas próximas a stops do destino via caminhada
+      // Chegada a pé ao destino a partir deste nó
       const walkableDestIds = destStops
         .filter(ds => haversineM(node.stop.lat, node.stop.lng, ds.lat, ds.lng) <= WALK_TRANSFER_MAX_M)
         .map(ds => ds.id);
 
       if (walkableDestIds.length > 0) {
-        // Chegou a pé ao destino
         for (const dId of walkableDestIds) {
           const ds = destStopMap.get(dId)!;
           const walkM = haversineM(node.stop.lat, node.stop.lng, ds.lat, ds.lng);
           const route: RouteOption = {
             legs: node.legs,
             summary: {
-              total_minutes:     node.totalMin + walkMinutes(walkM),
-              transfers:         node.transfers,
+              total_minutes:      node.totalMin + walkMinutes(walkM),
+              transfers:          Math.max(0, node.legs.length - 1), // corrigido: transfers = legs - 1
               estimated_cost_brl: node.totalCost,
             },
           };
@@ -270,14 +290,15 @@ async function bfsRoutes(
         }
       }
 
-      // Busca trips que conectam este stop a stops de destino
-      const trips = await getTripsFromStop(node.stopId, nearDestIds);
+      // Trips diretas para stops de destino
+      const trips = await getTripsFromStop(node.stopId, nearDestIds, tripsCache);
 
       for (const trip of trips.slice(0, 5)) {
         const destStop  = destStopMap.get(trip.dest_stop_id)!;
         const travelMin = await estimateTravelMinutes(
           trip.trip_id, trip.stop_count, trip.modal,
-          node.stopId, trip.dest_stop_id
+          node.stopId, trip.dest_stop_id,
+          freqCache
         );
         const shapeCoords = await getShapeForTrip(trip.trip_id, node.stopId, trip.dest_stop_id);
         const walkDest    = walkMinutes(destStop.distance_m);
@@ -298,7 +319,7 @@ async function bfsRoutes(
         const newLegs  = [...node.legs, leg];
         const newMin   = node.totalMin + travelMin + walkDest;
         const newCost  = node.totalCost + fare;
-        const newTrans = node.legs.length; // número de baldeações = legs - 1
+        const newTrans = Math.max(0, newLegs.length - 1); // corrigido: transfers = legs - 1
 
         const fp = newLegs.map(l => l.route_name + l.from_stop).join('|');
         if (!seenFingerprints.has(fp)) {
@@ -310,11 +331,8 @@ async function bfsRoutes(
         }
       }
 
-      // Se ainda não atingiu o máximo de baldeações, expande para paradas
-      // alcançáveis por esta condução (para continuar o BFS na próxima camada)
+      // Expansão BFS para próxima camada (baldeações)
       if (node.transfers < MAX_TRANSFERS) {
-        // Busca todas as trips saindo daqui para paradas intermediárias
-        // (usamos stops próximos ao destino como âncoras de expansão)
         const intermediateStops = await getNearbyStopsAlongRoute(
           node.stop.lat, node.stop.lng,
           destStops[0]?.lat ?? node.stop.lat,
@@ -324,13 +342,14 @@ async function bfsRoutes(
         for (const interStop of intermediateStops.slice(0, 8)) {
           if (interStop.id === node.stopId) continue;
           const prevBest = visited.get(interStop.id) ?? Infinity;
-          const interTrips = await getTripsFromStop(node.stopId, [interStop.id]);
+          const interTrips = await getTripsFromStop(node.stopId, [interStop.id], tripsCache);
           if (interTrips.length === 0) continue;
 
           const interTrip   = interTrips[0];
           const interMin    = await estimateTravelMinutes(
             interTrip.trip_id, interTrip.stop_count, interTrip.modal,
-            node.stopId, interStop.id
+            node.stopId, interStop.id,
+            freqCache
           );
           const interShape  = await getShapeForTrip(interTrip.trip_id, node.stopId, interStop.id);
           const newTotalMin = node.totalMin + interMin;
@@ -374,10 +393,8 @@ async function getNearbyStopsAlongRoute(
   originLat: number, originLng: number,
   destLat:   number, destLng:   number
 ): Promise<NearbyStop[]> {
-  // Ponto médio entre origem e destino
   const midLat = (originLat + destLat) / 2;
   const midLng = (originLng + destLng) / 2;
-  // Raio = metade da distância total, mínimo 1km
   const totalDist = haversineM(originLat, originLng, destLat, destLng);
   const radius    = Math.max(totalDist / 2, 1000);
 
