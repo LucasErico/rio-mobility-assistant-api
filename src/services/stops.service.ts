@@ -13,10 +13,17 @@ export interface NearbyStop {
 
 const SEARCH_RADIUS_M = 1000;
 
-export async function getNearbyStops(lat: number, lng: number): Promise<NearbyStop[]> {
+// Para origem: LIMIT 40 (performance - não precisamos de todos)
+// Para destino: LIMIT 60 (cobertura - terminais como Alvorada têm 46+ plataformas)
+export async function getNearbyStops(
+  lat: number,
+  lng: number,
+  isDestination = false
+): Promise<NearbyStop[]> {
   const results: NearbyStop[] = [];
+  const busLimit = isDestination ? 60 : 40;
 
-  // GTFS bus/BRT — raio 1000m, limite 40 para pegar tanto BRT quanto ônibus municipal
+  // GTFS bus/BRT
   const busResult = await pool.query(`
     SELECT
       stop_id   AS id,
@@ -35,8 +42,8 @@ export async function getNearbyStops(lat: number, lng: number): Promise<NearbySt
       $3
     )
     ORDER BY distance_m
-    LIMIT 40
-  `, [lat, lng, SEARCH_RADIUS_M]);
+    LIMIT $4
+  `, [lat, lng, SEARCH_RADIUS_M, busLimit]);
   results.push(...busResult.rows);
 
   // Metro stations
@@ -86,7 +93,7 @@ export async function getNearbyStops(lat: number, lng: number): Promise<NearbySt
   `, [lat, lng, SEARCH_RADIUS_M]);
   results.push(...trainResult.rows);
 
-  // VLT stops — colunas: id, siurb_id, name, line_name, geom
+  // VLT stops
   const vltResult = await pool.query(`
     SELECT
       id::text                  AS id,
