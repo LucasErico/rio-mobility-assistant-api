@@ -12,36 +12,74 @@ const MODAL_FARE: Record<string, number> = {
   brt:   5.00,
 };
 
-// ── Shape real para legs de rota GTFS (bus/brt) ───────────────────────────
+// ── Shape para legs de trilho (metro/trem/VLT) ────────────────────────────
+// Usa função SQL get_rail_line_polyline (Fase 4) via virtual_rail_structure
 async function resolveShapeForLeg(
   leg: RouteLeg
 ): Promise<{ lat: number; lng: number }[]> {
+
   if (leg.modal === 'metro' || leg.modal === 'trem' || leg.modal === 'vlt') {
-    // Para trilhos virtuais retornamos array vazio — o frontend desenha linha reta
-    // ou usa a geometria da linha curada. Fase 4 adiciona shapes reais.
-    return [];
+    try {
+      const railRes = await pool.query<{
+        rail_route_id: number;
+        from_seq: number;
+        to_seq: number;
+      }>(`
+        SELECT
+          vrs_from.rail_route_id,
+          vrs_from.stop_sequence AS from_seq,
+          vrs_to.stop_sequence   AS to_seq
+        FROM virtual_rail_structure vrs_from
+        JOIN virtual_rail_structure vrs_to
+          ON vrs_to.rail_route_id = vrs_from.rail_route_id
+        JOIN virtual_rail_routes vrr
+          ON vrr.id = vrs_from.rail_route_id
+        WHERE vrr.route_name = $1
+          AND ST_DWithin(
+            vrs_from.geom::geography,
+            ST_SetSRID(ST_MakePoint($3,$2),4326)::geography, 400
+          )
+          AND ST_DWithin(
+            vrs_to.geom::geography,
+            ST_SetSRID(ST_MakePoint($5,$4),4326)::geography, 400
+          )
+        LIMIT 1
+      `, [
+        leg.route_name,
+        leg.from_coords.lat, leg.from_coords.lng,
+        leg.to_coords.lat,   leg.to_coords.lng,
+      ]);
+
+      if (!railRes.rows.length) return [];
+      const { rail_route_id, from_seq, to_seq } = railRes.rows[0];
+
+      const pts = await pool.query<{ lat: number; lng: number }>(
+        `SELECT lat, lng FROM get_rail_line_polyline($1, $2, $3)`,
+        [rail_route_id, from_seq, to_seq]
+      );
+      return pts.rows.map(r => ({ lat: Number(r.lat), lng: Number(r.lng) }));
+    } catch {
+      return [];
+    }
   }
 
+  // ── Bus/BRT: usa get_precise_trip_polyline (Fase 4) ─────────────────────
+  // ST_MakeLine executado UMA única vez dentro da função SQL
   try {
-    // Busca trip_id para esse par (route_name, from_stop, to_stop)
-    const tripRes = await pool.query<{ trip_id: string; shape_id: string | null }>(`
-      SELECT DISTINCT t.trip_id, t.shape_id
+    const tripRes = await pool.query<{ shape_id: string | null }>(`
+      SELECT DISTINCT t.shape_id
       FROM gtfs_trips t
-      JOIN gtfs_routes r   ON r.route_id = t.route_id
+      JOIN gtfs_routes r    ON r.route_id = t.route_id
       JOIN gtfs_stop_times st1 ON st1.trip_id = t.trip_id
       JOIN gtfs_stop_times st2 ON st2.trip_id = t.trip_id
       JOIN gtfs_stops s1   ON s1.stop_id = st1.stop_id
       JOIN gtfs_stops s2   ON s2.stop_id = st2.stop_id
       WHERE COALESCE(r.route_short_name, r.route_long_name) = $1
         AND st2.stop_sequence > st1.stop_sequence
-        AND ST_DWithin(
-          s1.geom::geography,
-          ST_SetSRID(ST_MakePoint($3, $2), 4326)::geography, 300
-        )
-        AND ST_DWithin(
-          s2.geom::geography,
-          ST_SetSRID(ST_MakePoint($5, $4), 4326)::geography, 300
-        )
+        AND ST_DWithin(s1.geom::geography,
+          ST_SetSRID(ST_MakePoint($3,$2),4326)::geography, 300)
+        AND ST_DWithin(s2.geom::geography,
+          ST_SetSRID(ST_MakePoint($5,$4),4326)::geography, 300)
       LIMIT 1
     `, [
       leg.route_name,
@@ -51,57 +89,21 @@ async function resolveShapeForLeg(
 
     if (!tripRes.rows.length || !tripRes.rows[0].shape_id) return [];
 
-    const { trip_id, shape_id } = tripRes.rows[0];
-
-    // Fractions via ST_LineLocatePoint
-    const fracRes = await pool.query<{ frac_from: number; frac_to: number }>(`
-      WITH shape_line AS (
-        SELECT ST_MakeLine(
-          ST_SetSRID(ST_MakePoint(shape_pt_lon, shape_pt_lat), 4326)
-          ORDER BY shape_pt_sequence
-        ) AS line
-        FROM gtfs_shapes WHERE shape_id = $1
-      )
-      SELECT
-        ST_LineLocatePoint(line, ST_SetSRID(ST_MakePoint($3,$2),4326)) AS frac_from,
-        ST_LineLocatePoint(line, ST_SetSRID(ST_MakePoint($5,$4),4326)) AS frac_to
-      FROM shape_line
-    `, [
-      shape_id,
-      leg.from_coords.lat, leg.from_coords.lng,
-      leg.to_coords.lat,   leg.to_coords.lng,
-    ]);
-
-    if (!fracRes.rows.length) return [];
-    let { frac_from, frac_to } = fracRes.rows[0];
-    if (frac_from > frac_to) [frac_from, frac_to] = [frac_to, frac_from];
-
-    const shapeRes = await pool.query<{ lat: number; lng: number }>(`
-      WITH shape_line AS (
-        SELECT ST_MakeLine(
-          ST_SetSRID(ST_MakePoint(shape_pt_lon, shape_pt_lat), 4326)
-          ORDER BY shape_pt_sequence
-        ) AS line
-        FROM gtfs_shapes WHERE shape_id = $1
-      )
-      SELECT shape_pt_lat AS lat, shape_pt_lon AS lng
-      FROM gtfs_shapes gs, shape_line sl
-      WHERE gs.shape_id = $1
-        AND ST_LineLocatePoint(
-          sl.line,
-          ST_SetSRID(ST_MakePoint(gs.shape_pt_lon, gs.shape_pt_lat), 4326)
-        ) BETWEEN $2 AND $3
-      ORDER BY gs.shape_pt_sequence
-      LIMIT 250
-    `, [shape_id, frac_from, frac_to]);
-
-    return shapeRes.rows.map(r => ({ lat: Number(r.lat), lng: Number(r.lng) }));
+    const pts = await pool.query<{ lat: number; lng: number }>(
+      `SELECT lat, lng FROM get_precise_trip_polyline($1,$2,$3,$4,$5)`,
+      [
+        tripRes.rows[0].shape_id,
+        leg.from_coords.lat, leg.from_coords.lng,
+        leg.to_coords.lat,   leg.to_coords.lng,
+      ]
+    );
+    return pts.rows.map(r => ({ lat: Number(r.lat), lng: Number(r.lng) }));
   } catch {
     return [];
   }
 }
 
-// ── Entry point público — mesma assinatura que o BFS anterior ────────────────
+// ── Entry point público ──────────────────────────────────────────────────
 export async function calculateRoutesRaptor(
   originLat: number, originLng: number,
   destLat:   number, destLng:   number,
@@ -115,7 +117,6 @@ export async function calculateRoutesRaptor(
     throw new Error('Nenhuma rota encontrada entre os pontos informados.');
   }
 
-  // Resolve shapes em paralelo para todas as legs
   const withShapes = await Promise.all(
     raw.map(async route => ({
       ...route,
@@ -123,8 +124,6 @@ export async function calculateRoutesRaptor(
         route.legs.map(async leg => ({
           ...leg,
           shape_coords: await resolveShapeForLeg(leg),
-          // Corrige tarifa usando o map oficial 2026
-          estimated_minutes: leg.estimated_minutes,
         }))
       ),
       summary: {
