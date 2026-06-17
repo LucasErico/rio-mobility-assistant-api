@@ -1,5 +1,6 @@
 import { pool } from '../db';
 import { getNearbyStops, NearbyStop } from './stops.service';
+import { calculateRoutesRaptor } from '../raptor/raptor.service';
 
 export type Priority = 'cheaper' | 'faster' | 'less_transfers';
 
@@ -35,17 +36,15 @@ const MODAL_FARE: Record<string, number> = {
 
 // Velocidade média em metros/min por modal
 const MODAL_SPEED_M_PER_MIN: Record<string, number> = {
-  bus:   250,   // ~15 km/h
-  brt:   450,   // ~27 km/h corredor exclusivo
-  metro: 600,   // ~36 km/h
+  bus:   250,
+  brt:   450,
+  metro: 600,
   train: 550,
   vlt:   300,
 };
 
-// Bonus de penalidade/preferência por modal (minutos adicionados ao score)
-// Negativo = preferido, positivo = penalizado
 const MODAL_SPEED_BONUS: Record<string, number> = {
-  brt:   -5,   // BRT é mais rápido que ônibus comum na mesma distância
+  brt:   -5,
   metro: -8,
   train: -3,
   vlt:   -2,
@@ -53,7 +52,7 @@ const MODAL_SPEED_BONUS: Record<string, number> = {
 };
 
 const WALK_SPEED_M_PER_MIN = 80;
-const WALK_TRANSFER_MAX_M  = 500;  // aumentado de 400 para 500m
+const WALK_TRANSFER_MAX_M  = 500;
 const MAX_TRANSFERS        = 3;
 
 function walkMinutes(meters: number): number {
@@ -74,7 +73,6 @@ function haversineM(
   return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
-// ─── Shape real via ST_LineLocatePoint ────────────────────────────────────────
 async function getShapeForTrip(
   tripId: string,
   fromStopId: string,
@@ -148,9 +146,6 @@ async function getShapeForTrip(
   }
 }
 
-// ─── Trips de um stop para um conjunto de stops de destino ───────────────────
-// Retorna até 10 trips, ordenadas por: mais rápido (distância real) primeiro.
-// Inclui route_type para que o BFS possa aplicar preferência de modal.
 async function getTripsFromStop(
   stopId: string,
   candidateDestStopIds: string[],
@@ -196,8 +191,6 @@ async function getTripsFromStop(
      JOIN gtfs_trips t  ON t.trip_id  = st1.trip_id
      JOIN gtfs_routes r ON r.route_id = t.route_id
      WHERE st1.stop_id = $1
-     -- Prioriza modais mais rápidos (menor route_type = metro/trem = mais rápido)
-     -- Para mesmo route_type, menos paradas intermediárias
      ORDER BY
        CASE r.route_type WHEN 1 THEN 0 WHEN 2 THEN 1 WHEN 700 THEN 2 WHEN 702 THEN 3 ELSE 4 END,
        stop_count
@@ -209,7 +202,6 @@ async function getTripsFromStop(
   return res.rows;
 }
 
-// ─── Estimativa de tempo ──────────────────────────────────────────────────────
 async function estimateTravelMinutes(
   tripId: string,
   stopCount: number,
@@ -236,7 +228,6 @@ async function estimateTravelMinutes(
     ? Math.ceil(distM / speed)
     : stopCount * (modal === 'brt' ? 1.5 : 2);
 
-  // Aplica bônus de modal (BRT/metro são mais rápidos que ônibus na prática)
   const speedBonus = MODAL_SPEED_BONUS[modal] ?? 0;
 
   let waitMin = 12;
@@ -256,9 +247,6 @@ async function estimateTravelMinutes(
   return Math.max(1, waitMin + travelMin + speedBonus);
 }
 
-// ─── Stops ao longo da rota para expansão BFS multi-hop ──────────────────────
-// Usa múltiplos pontos da rota (25%, 50%, 75%) em vez de só o midpoint
-// para garantir cobertura em rotas longas como Recreio → Candelária (25km)
 async function getNearbyStopsAlongRoute(
   originLat: number, originLng: number,
   destLat:   number, destLng:   number,
@@ -266,13 +254,11 @@ async function getNearbyStopsAlongRoute(
 ): Promise<NearbyStop[]> {
   const totalDistM = haversineM(originLat, originLng, destLat, destLng);
 
-  // Pontos de amostragem: 25%, 50%, 75% do trajeto
   const samplePoints = [0.25, 0.50, 0.75].map(frac => ({
     lat: originLat + frac * (destLat - originLat),
     lng: originLng + frac * (destLng - originLng),
   }));
 
-  // Raio adaptativo: maior em trajetos curtos, menor em trajetos longos
   const radius = Math.min(Math.max(totalDistM * 0.15, 800), 2000);
 
   const allStops: NearbyStop[] = [];
@@ -312,7 +298,6 @@ async function getNearbyStopsAlongRoute(
   return allStops;
 }
 
-// ─── Nó BFS ───────────────────────────────────────────────────────────────────
 interface BfsNode {
   stopId:    string;
   stop:      NearbyStop;
@@ -322,7 +307,6 @@ interface BfsNode {
   transfers: number;
 }
 
-// ─── BFS principal ────────────────────────────────────────────────────────────
 async function bfsRoutes(
   originStops: NearbyStop[],
   destStops:   NearbyStop[],
@@ -333,7 +317,7 @@ async function bfsRoutes(
   const seenFingerprints = new Set<string>();
   const tripsCache:      Map<string, any[]>  = new Map();
   const freqCache:       Map<string, number> = new Map();
-  const globalVisited:   Map<string, number> = new Map(); // stopId → melhor totalMin
+  const globalVisited:   Map<string, number> = new Map();
   const visitedIds:      Set<string> = new Set(originStops.map(s => s.id));
 
   let queue: BfsNode[] = originStops.map(s => ({
@@ -353,7 +337,6 @@ async function bfsRoutes(
 
       const nearDestIds = destStops.map(s => s.id);
 
-      // ── Chegada a pé ao destino ──────────────────────────────────────────
       const walkableDestIds = destStops
         .filter(ds =>
           haversineM(node.stop.lat, node.stop.lng, ds.lat, ds.lng) <= WALK_TRANSFER_MAX_M
@@ -380,7 +363,6 @@ async function bfsRoutes(
         if (foundRoutes.length >= 5) break;
       }
 
-      // ── Trips diretas origem → destino ────────────────────────────────────
       const trips = await getTripsFromStop(node.stopId, nearDestIds, tripsCache);
       for (const trip of trips.slice(0, 5)) {
         const destStop  = destStopMap.get(trip.dest_stop_id)!;
@@ -423,7 +405,6 @@ async function bfsRoutes(
 
       if (foundRoutes.length >= 5) break;
 
-      // ── Expansão para baldeação ───────────────────────────────────────────
       if (node.transfers < MAX_TRANSFERS) {
         const interStops = await getNearbyStopsAlongRoute(
           node.stop.lat, node.stop.lng,
@@ -501,11 +482,28 @@ function sortByPriority(
   });
 }
 
+// ── Entry point público ──────────────────────────────────────────────────────────
+// Tenta RAPTOR primeiro; se falhar (grafo sem cobertura), cai no BFS legado.
 export async function calculateRoutes(
   originLat: number, originLng: number,
   destLat:   number, destLng:   number,
   priority:  Priority
 ): Promise<RouteOption[]> {
+  // 1. Tenta motor RAPTOR
+  try {
+    const raptorRoutes = await calculateRoutesRaptor(
+      originLat, originLng, destLat, destLng, priority
+    );
+    if (raptorRoutes.length > 0) {
+      console.log(`[routing] RAPTOR retornou ${raptorRoutes.length} rota(s)`);
+      return raptorRoutes;
+    }
+  } catch (err) {
+    console.warn('[routing] RAPTOR falhou, usando BFS legado:', (err as Error).message);
+  }
+
+  // 2. Fallback: BFS legado (preservado para garantir disponibilidade)
+  console.log('[routing] Usando BFS legado');
   const [originStops, destStops] = await Promise.all([
     getNearbyStops(originLat, originLng, false),
     getNearbyStops(destLat,   destLng,   true),
