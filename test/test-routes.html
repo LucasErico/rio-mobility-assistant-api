@@ -1,0 +1,400 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Rio Mobility — Testes de Rota</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: 'Segoe UI', sans-serif;
+      background: #0f1117;
+      color: #e0e0e0;
+      min-height: 100vh;
+      padding: 24px;
+    }
+    h1 {
+      font-size: 20px;
+      font-weight: 700;
+      color: #fff;
+      margin-bottom: 6px;
+    }
+    .subtitle {
+      font-size: 13px;
+      color: #888;
+      margin-bottom: 28px;
+    }
+    .api-config {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 28px;
+    }
+    .api-config label { font-size: 13px; color: #aaa; white-space: nowrap; }
+    .api-config input {
+      flex: 1;
+      background: #1e2130;
+      border: 1px solid #333;
+      border-radius: 8px;
+      padding: 8px 12px;
+      color: #e0e0e0;
+      font-size: 13px;
+    }
+    .cards {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+      gap: 20px;
+    }
+    .card {
+      background: #1a1d2e;
+      border: 1px solid #2a2d40;
+      border-radius: 14px;
+      padding: 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+    .card-header {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 10px;
+    }
+    .card-title {
+      font-size: 14px;
+      font-weight: 600;
+      color: #fff;
+      line-height: 1.4;
+    }
+    .badge {
+      font-size: 11px;
+      padding: 3px 9px;
+      border-radius: 20px;
+      white-space: nowrap;
+      font-weight: 600;
+    }
+    .badge-brt  { background: #1a3a2a; color: #4ade80; border: 1px solid #2d6b45; }
+    .badge-metro{ background: #1a2a3a; color: #60a5fa; border: 1px solid #2d4d6b; }
+    .badge-bus  { background: #2a1a1a; color: #fb923c; border: 1px solid #6b2d2d; }
+    .route-desc {
+      font-size: 12px;
+      color: #aaa;
+      line-height: 1.6;
+      border-left: 3px solid #333;
+      padding-left: 10px;
+    }
+    .route-desc strong { color: #ddd; }
+    .priority-row {
+      display: flex;
+      gap: 8px;
+    }
+    .priority-btn {
+      flex: 1;
+      padding: 6px;
+      border-radius: 8px;
+      border: 1px solid #333;
+      background: #13151f;
+      color: #888;
+      font-size: 11px;
+      cursor: pointer;
+      transition: all .15s;
+    }
+    .priority-btn.active {
+      border-color: #4f7eff;
+      background: #1a2550;
+      color: #7da4ff;
+    }
+    .run-btn {
+      background: #2d4bff;
+      color: #fff;
+      border: none;
+      border-radius: 10px;
+      padding: 10px;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background .15s;
+    }
+    .run-btn:hover { background: #4060ff; }
+    .run-btn:disabled { background: #333; color: #666; cursor: not-allowed; }
+    .result-box {
+      background: #0d0f1a;
+      border: 1px solid #1e2130;
+      border-radius: 10px;
+      padding: 14px;
+      min-height: 80px;
+      display: none;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .result-box.visible { display: flex; }
+    .status-bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .status-pill {
+      font-size: 11px;
+      padding: 3px 10px;
+      border-radius: 20px;
+      font-weight: 600;
+    }
+    .status-ok    { background: #0d2a15; color: #4ade80; border: 1px solid #1a5c2a; }
+    .status-error { background: #2a0d0d; color: #f87171; border: 1px solid #5c1a1a; }
+    .status-loading { background: #1a1a2a; color: #93c5fd; border: 1px solid #2a2a5c; }
+    .latency { font-size: 11px; color: #666; }
+    .legs-list { display: flex; flex-direction: column; gap: 6px; }
+    .leg {
+      background: #13151f;
+      border-radius: 8px;
+      padding: 8px 10px;
+      font-size: 12px;
+      line-height: 1.5;
+      border-left: 3px solid #333;
+    }
+    .leg.brt   { border-color: #4ade80; }
+    .leg.metro { border-color: #60a5fa; }
+    .leg.bus   { border-color: #fb923c; }
+    .leg.walk  { border-color: #a78bfa; }
+    .leg-modal {
+      font-size: 10px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: .5px;
+      margin-bottom: 2px;
+    }
+    .leg.brt   .leg-modal { color: #4ade80; }
+    .leg.metro .leg-modal { color: #60a5fa; }
+    .leg.bus   .leg-modal { color: #fb923c; }
+    .leg.walk  .leg-modal { color: #a78bfa; }
+    .leg-detail { color: #bbb; }
+    .summary-row {
+      display: flex;
+      gap: 12px;
+      font-size: 12px;
+      color: #888;
+      padding-top: 6px;
+      border-top: 1px solid #1e2130;
+    }
+    .summary-row span strong { color: #ddd; }
+    .raw-toggle {
+      font-size: 11px;
+      color: #4f7eff;
+      cursor: pointer;
+      text-align: right;
+      margin-top: 2px;
+    }
+    .raw-json {
+      background: #0a0c14;
+      border-radius: 8px;
+      padding: 10px;
+      font-size: 10px;
+      color: #7a8aaa;
+      white-space: pre-wrap;
+      word-break: break-all;
+      max-height: 200px;
+      overflow-y: auto;
+      display: none;
+    }
+    .raw-json.visible { display: block; }
+    .error-msg { font-size: 12px; color: #f87171; }
+  </style>
+</head>
+<body>
+
+<h1>🚦 Rio Mobility — Testes de Rota</h1>
+<p class="subtitle">Validação manual das 3 rotas principais do MVP</p>
+
+<div class="api-config">
+  <label>API URL:</label>
+  <input type="text" id="apiBase" value="https://rio-mobility-assistant-api-zgrb.onrender.com" />
+</div>
+
+<div class="cards">
+
+  <!-- ROTA 1 -->
+  <div class="card" id="card-0">
+    <div class="card-header">
+      <div class="card-title">Recreio Shopping → Ipanema</div>
+      <span class="badge badge-brt">BRT + Metro</span>
+    </div>
+    <div class="route-desc">
+      <strong>Esperado:</strong> BRT 18 (Recreio → Jd. Oceânico) + Metro Linha 4 (Jd. Oceânico → Nsa Sra da Paz/Ipanema)
+    </div>
+    <div class="priority-row" data-card="0">
+      <button class="priority-btn active" data-p="fastest">&#9889; Rápido</button>
+      <button class="priority-btn" data-p="cheapest">💰 Barato</button>
+      <button class="priority-btn" data-p="least_transfers">🔄 Menos trocas</button>
+    </div>
+    <button class="run-btn" onclick="runTest(0)">&#9654; Executar teste</button>
+    <div class="result-box" id="result-0"></div>
+  </div>
+
+  <!-- ROTA 2 -->
+  <div class="card" id="card-1">
+    <div class="card-header">
+      <div class="card-title">Deodoro → Terminal Gentileza</div>
+      <span class="badge badge-brt">BRT</span>
+    </div>
+    <div class="route-desc">
+      <strong>Esperado:</strong> BRT 60 ou 61 (Deodoro → Terminal Gentileza)
+    </div>
+    <div class="priority-row" data-card="1">
+      <button class="priority-btn active" data-p="fastest">&#9889; Rápido</button>
+      <button class="priority-btn" data-p="cheapest">💰 Barato</button>
+      <button class="priority-btn" data-p="least_transfers">🔄 Menos trocas</button>
+    </div>
+    <button class="run-btn" onclick="runTest(1)">&#9654; Executar teste</button>
+    <div class="result-box" id="result-1"></div>
+  </div>
+
+  <!-- ROTA 3 -->
+  <div class="card" id="card-2">
+    <div class="card-header">
+      <div class="card-title">Vila Valqueire → Candelária</div>
+      <span class="badge badge-bus">Ônibus</span>
+    </div>
+    <div class="route-desc">
+      <strong>Esperado:</strong> Ônibus 363 (Vila Valqueire → Candelária)
+    </div>
+    <div class="priority-row" data-card="2">
+      <button class="priority-btn active" data-p="fastest">&#9889; Rápido</button>
+      <button class="priority-btn" data-p="cheapest">💰 Barato</button>
+      <button class="priority-btn" data-p="least_transfers">🔄 Menos trocas</button>
+    </div>
+    <button class="run-btn" onclick="runTest(2)">&#9654; Executar teste</button>
+    <div class="result-box" id="result-2"></div>
+  </div>
+
+</div>
+
+<script>
+  const TESTS = [
+    { origin: 'Recreio Shopping, Rio de Janeiro', destination: 'Ipanema, Rio de Janeiro' },
+    { origin: 'Deodoro, Rio de Janeiro',          destination: 'Terminal Gentileza, Rio de Janeiro' },
+    { origin: 'Vila Valqueire, Rio de Janeiro',   destination: 'Candelária, Rio de Janeiro' },
+  ];
+
+  const priorities = ['fastest', 'fastest', 'fastest'];
+
+  // Priority buttons
+  document.querySelectorAll('.priority-row').forEach(row => {
+    const cardIdx = parseInt(row.dataset.card);
+    row.querySelectorAll('.priority-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        row.querySelectorAll('.priority-btn').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+        priorities[cardIdx] = btn.dataset.p;
+      });
+    });
+  });
+
+  function modalClass(modal) {
+    if (!modal) return '';
+    const m = modal.toLowerCase();
+    if (m.includes('brt')) return 'brt';
+    if (m.includes('metro')) return 'metro';
+    if (m.includes('bus') || m.includes('ônibus')) return 'bus';
+    if (m.includes('walk') || m.includes('a pé')) return 'walk';
+    return '';
+  }
+
+  function renderLegs(legs) {
+    if (!legs || legs.length === 0) return '<div class="error-msg">Nenhuma leg retornada</div>';
+    return legs.map(leg => {
+      const cls = modalClass(leg.modal || leg.mode || '');
+      const lineInfo = leg.line_code ? ` • Linha <strong>${leg.line_code}</strong>` : '';
+      const from = leg.from_stop || leg.from || leg.origin || '—';
+      const to   = leg.to_stop   || leg.to   || leg.destination || '—';
+      const dur  = leg.estimated_minutes ? `${Math.round(leg.estimated_minutes)} min` : '';
+      const fare = leg.fare != null ? ` • R$ ${Number(leg.fare).toFixed(2)}` : '';
+      return `
+        <div class="leg ${cls}">
+          <div class="leg-modal">${leg.modal || leg.mode || 'seg'}</div>
+          <div class="leg-detail">${from} → ${to}${lineInfo}</div>
+          ${dur ? `<div class="leg-detail">${dur}${fare}</div>` : ''}
+        </div>`;
+    }).join('');
+  }
+
+  async function runTest(idx) {
+    const apiBase = document.getElementById('apiBase').value.trim().replace(/\/$/, '');
+    const btn     = document.querySelector(`#card-${idx} .run-btn`);
+    const box     = document.getElementById(`result-${idx}`);
+    const test    = TESTS[idx];
+    const priority = priorities[idx];
+
+    btn.disabled = true;
+    btn.textContent = 'Aguardando...';
+    box.className = 'result-box visible';
+    box.innerHTML = `
+      <div class="status-bar">
+        <span class="status-pill status-loading">⏳ Processando</span>
+        <span class="latency">aguardando resposta...</span>
+      </div>`;
+
+    const t0 = Date.now();
+    try {
+      const res = await fetch(`${apiBase}/api/route`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          origin:      test.origin,
+          destination: test.destination,
+          priority
+        })
+      });
+
+      const latency = ((Date.now() - t0) / 1000).toFixed(1) + 's';
+      const data    = await res.json();
+
+      if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+
+      // Tenta achar legs em diferentes estruturas possíveis de resposta
+      const options = data.options || data.routes || (Array.isArray(data) ? data : [data]);
+      const best    = options[0] || {};
+      const legs    = best.legs || best.steps || [];
+
+      const totalMin  = best.total_minutes ?? best.duration ?? null;
+      const totalFare = best.total_fare   ?? best.fare      ?? null;
+      const transfers = best.transfers    ?? (legs.length > 1 ? legs.length - 1 : null);
+
+      const summaryParts = [];
+      if (totalMin  != null) summaryParts.push(`<span><strong>${Math.round(totalMin)} min</strong> total</span>`);
+      if (totalFare != null) summaryParts.push(`<span>R$ <strong>${Number(totalFare).toFixed(2)}</strong></span>`);
+      if (transfers != null) summaryParts.push(`<span><strong>${transfers}</strong> baldeação(ões)</span>`);
+
+      const uid = `raw-${idx}-${Date.now()}`;
+
+      box.innerHTML = `
+        <div class="status-bar">
+          <span class="status-pill status-ok">✓ OK</span>
+          <span class="latency">${latency}</span>
+        </div>
+        <div class="legs-list">${renderLegs(legs)}</div>
+        ${summaryParts.length ? `<div class="summary-row">${summaryParts.join('')}</div>` : ''}
+        <div class="raw-toggle" onclick="toggleRaw('${uid}')">Ver JSON bruto ▾</div>
+        <pre class="raw-json" id="${uid}">${JSON.stringify(data, null, 2)}</pre>`;
+
+    } catch (err) {
+      const latency = ((Date.now() - t0) / 1000).toFixed(1) + 's';
+      box.innerHTML = `
+        <div class="status-bar">
+          <span class="status-pill status-error">✗ Erro</span>
+          <span class="latency">${latency}</span>
+        </div>
+        <div class="error-msg">${err.message}</div>`;
+    } finally {
+      btn.disabled = false;
+      btn.textContent = '\u25b6 Executar teste';
+    }
+  }
+
+  function toggleRaw(id) {
+    const el = document.getElementById(id);
+    el.classList.toggle('visible');
+  }
+</script>
+
+</body>
+</html>
