@@ -1,40 +1,31 @@
 import { pool } from '../db';
 import { getNearbyStops, NearbyStop } from './stops.service';
-import { calculateRoutesRaptor } from '../raptor/raptor.service';
+import { calculateRoutesRaptor, MODAL_FARE } from '../raptor/raptor.service'; // FIX-14: fonte unica
 import { geocodeAddress } from '../utils/geocode';
 import { buildSemanticPlan } from './semantic-planner.service';
-import type { RouteOption, RouteLeg } from '../raptor/types';
+import type { RouteOption, RouteLeg, Priority } from '../raptor/types'; // FIX-15: importar, nao redeclarar
 
-export type Priority = 'cheaper' | 'faster' | 'less_transfers';
-export type { RouteOption, RouteLeg };
+export type { RouteOption, RouteLeg, Priority };
 
-// Tarifas 2026
-const MODAL_FARE: Record<string, number> = {
-  bus:   5.00,
-  metro: 7.90,
-  train: 7.60,
-  trem:  7.60,
-  vlt:   5.00,
-  brt:   5.00,
-};
-
-// Velocidade média em metros/min por modal
+// Velocidade media em metros/min por modal
 const MODAL_SPEED_M_PER_MIN: Record<string, number> = {
-  bus:   250,
-  brt:   450,
-  metro: 600,
-  train: 550,
-  trem:  550,
-  vlt:   300,
+  bus:         250,
+  brt:         450,
+  metro:       600,
+  train:       550,
+  trem:        550,
+  vlt:         300,
+  bus_express: 480,
 };
 
 const MODAL_SPEED_BONUS: Record<string, number> = {
-  brt:   -5,
-  metro: -8,
-  train: -3,
-  trem:  -3,
-  vlt:   -2,
-  bus:    0,
+  brt:         -5,
+  metro:       -8,
+  train:       -3,
+  trem:        -3,
+  vlt:         -2,
+  bus:          0,
+  bus_express:  0,
 };
 
 const WALK_SPEED_M_PER_MIN = 80;
@@ -152,16 +143,18 @@ async function getTripsFromStop(
   if (cache.has(cacheKey)) return cache.get(cacheKey)!;
 
   const res = await pool.query(
+    // FIX-06: mapa correto de route_type -> modal (igual ao graph-loader.ts)
+    // 0=VLT, 1=Metro, 2=Trem, 700=bus generico, 702=BRT SPPO, 200=bus_express
     `SELECT
        st1.trip_id,
        COALESCE(r.route_short_name, r.route_long_name) AS route_name,
        CASE r.route_type
+         WHEN 0   THEN 'vlt'
          WHEN 1   THEN 'metro'
          WHEN 2   THEN 'trem'
-         WHEN 0   THEN 'vlt'
-         WHEN 700 THEN 'brt'
-         WHEN 702 THEN 'bus'
-         WHEN 200 THEN 'bus'
+         WHEN 700 THEN 'bus'
+         WHEN 702 THEN 'brt'
+         WHEN 200 THEN 'bus_express'
          ELSE          'bus'
        END AS modal,
        r.route_type,
@@ -178,7 +171,7 @@ async function getTripsFromStop(
      JOIN gtfs_routes r ON r.route_id = t.route_id
      WHERE st1.stop_id = $1
      ORDER BY
-       CASE r.route_type WHEN 1 THEN 0 WHEN 2 THEN 1 WHEN 700 THEN 2 WHEN 702 THEN 3 ELSE 4 END,
+       CASE r.route_type WHEN 1 THEN 0 WHEN 2 THEN 1 WHEN 702 THEN 2 WHEN 700 THEN 3 ELSE 4 END,
        stop_count
      LIMIT 10`,
     [stopId, candidateDestStopIds]
@@ -240,10 +233,26 @@ async function getNearbyStopsAlongRoute(
 ): Promise<NearbyStop[]> {
   const totalDistM = haversineM(originLat, originLng, destLat, destLng);
 
-  const samplePoints = [0.25, 0.50, 0.75].map(frac => ({
+  // FIX-11: pontos de amostragem com offset lateral para rotas costeiras
+  // (ex: Recreio->Centro via Niemeyer que a linha reta cruzaria o oceano)
+  const fracs = [0.25, 0.50, 0.75];
+  const samplePoints = fracs.map(frac => ({
     lat: originLat + frac * (destLat - originLat),
     lng: originLng + frac * (destLng - originLng),
   }));
+
+  // Para rotas longas (>15km), adiciona pontos com desvio lateral de ~2km
+  // para capturar paradas em rotas que contornam obstaculos geograficos
+  if (totalDistM > 15000) {
+    const dLat = (destLat - originLat);
+    const dLng = (destLng - originLng);
+    const perpLat =  dLng * 0.018; // ~2km de desvio lateral
+    const perpLng = -dLat * 0.018;
+    samplePoints.push(
+      { lat: originLat + 0.5 * dLat + perpLat, lng: originLng + 0.5 * dLng + perpLng },
+      { lat: originLat + 0.5 * dLat - perpLat, lng: originLng + 0.5 * dLng - perpLng }
+    );
+  }
 
   const radius = Math.min(Math.max(totalDistM * 0.15, 800), 2000);
 
@@ -359,7 +368,7 @@ async function bfsRoutes(
         const shapeCoords = await getShapeForTrip(
           trip.trip_id, node.stopId, trip.dest_stop_id
         );
-        const fare = MODAL_FARE[trip.modal] ?? MODAL_FARE.bus;
+        const fare = MODAL_FARE[trip.modal] ?? MODAL_FARE.bus; // FIX-14: fonte unica
 
         const leg: RouteLeg = {
           modal:             trip.modal,
@@ -468,10 +477,6 @@ function sortByPriority(
   });
 }
 
-// ── Camada 3: geocodifica waypoints do plano semântico ───────────────────────
-// Para cada leg do plano semântico, resolve coordenadas do waypoint.
-// Se o waypoint falhar no geocoding, é ignorado silenciosamente (modo degradado
-// para aquele segmento — RAPTOR tentará o segmento maior).
 async function geocodeWaypoints(
   legs: { waypoint_name: string; modal: string; line_code: string; leg: number }[]
 ): Promise<{ name: string; lat: number; lng: number; modal: string; leg: number }[]> {
@@ -496,30 +501,24 @@ async function geocodeWaypoints(
   return resolved;
 }
 
-// ── Roteamento por segmentos via RAPTOR com waypoints ───────────────────────
-// Divide a rota em segmentos entre waypoints consecutivos e roda RAPTOR em
-// cada par em paralelo. Concatena as legs resultantes.
 async function routeWithWaypoints(
   originLat:  number, originLng:  number,
   destLat:    number, destLng:    number,
   waypoints:  { name: string; lat: number; lng: number; modal: string; leg: number }[],
   priority:   Priority
 ): Promise<RouteOption[]> {
-  // Monta sequência de pontos: origem → waypoints ordenados → destino
   const points = [
     { lat: originLat, lng: originLng },
     ...waypoints.sort((a, b) => a.leg - b.leg).map(w => ({ lat: w.lat, lng: w.lng })),
     { lat: destLat,   lng: destLng   },
   ];
 
-  // Roda RAPTOR em cada par de pontos consecutivos em paralelo
   const segmentResults = await Promise.allSettled(
     points.slice(0, -1).map((from, i) =>
       calculateRoutesRaptor(from.lat, from.lng, points[i + 1].lat, points[i + 1].lng, priority)
     )
   );
 
-  // Coleta apenas os segmentos que tiveram sucesso
   const validSegments: RouteOption[][] = [];
   for (let i = 0; i < segmentResults.length; i++) {
     const r = segmentResults[i];
@@ -532,11 +531,10 @@ async function routeWithWaypoints(
 
   if (validSegments.length === 0) return [];
 
-  // Pega a melhor opção de cada segmento e concatena as legs
   const mergedLegs: RouteLeg[] = validSegments.map(seg => seg[0].legs).flat();
-  const totalMinutes      = validSegments.reduce((acc, seg) => acc + seg[0].summary.total_minutes, 0);
-  const totalTransfers    = validSegments.reduce((acc, seg) => acc + seg[0].summary.transfers, 0);
-  const totalCost         = mergedLegs.reduce((acc, l) => acc + (MODAL_FARE[l.modal] ?? 5.00), 0);
+  const totalMinutes   = validSegments.reduce((acc, seg) => acc + seg[0].summary.total_minutes, 0);
+  const totalTransfers = validSegments.reduce((acc, seg) => acc + seg[0].summary.transfers, 0);
+  const totalCost      = mergedLegs.reduce((acc, l) => acc + (MODAL_FARE[l.modal] ?? 5.00), 0);
 
   return [{
     legs: mergedLegs,
@@ -548,10 +546,6 @@ async function routeWithWaypoints(
   }];
 }
 
-// ── Entry point público ──────────────────────────────────────────────────────
-// originText / destText são opcionais.
-// Se fornecidos, ativa o pipeline Tribunal de Fontes (Camadas 2+3).
-// Se omitidos, comportamento legado preservado.
 export async function calculateRoutes(
   originLat:  number, originLng:  number,
   destLat:    number, destLng:    number,
@@ -560,18 +554,16 @@ export async function calculateRoutes(
   destText?:   string
 ): Promise<RouteOption[]> {
 
-  // ── Pipeline Tribunal de Fontes (Camadas 2 + 3) ──────────────────────────
   if (originText && destText) {
     try {
       const plan = await buildSemanticPlan(originText, destText);
 
       if (!plan.degraded && plan.legs.length > 0) {
-        // Camada 3: geocodifica waypoints em paralelo
         const waypoints = await geocodeWaypoints(plan.legs);
 
         if (waypoints.length > 0) {
           console.log(
-            `[routing] Plano semântico com ${waypoints.length} waypoint(s) ` +
+            `[routing] Plano semantico com ${waypoints.length} waypoint(s) ` +
             `(fonte: ${plan.source}, score: ${plan.score}). Roteando por segmentos...`
           );
 
@@ -580,21 +572,20 @@ export async function calculateRoutes(
           );
 
           if (waypointRoutes.length > 0) {
-            console.log('[routing] Rota com waypoints semânticos concluída.');
+            console.log('[routing] Rota com waypoints semanticos concluida.');
             return sortByPriority(waypointRoutes, priority);
           }
         }
 
         console.warn('[routing] Waypoints geocodificados mas RAPTOR por segmento falhou. Caindo para RAPTOR direto.');
       } else {
-        console.log(`[routing] Plano semântico degradado (score: ${plan.score}). Usando RAPTOR direto.`);
+        console.log(`[routing] Plano semantico degradado (score: ${plan.score}). Usando RAPTOR direto.`);
       }
     } catch (err) {
       console.warn('[routing] Tribunal de Fontes falhou, continuando com RAPTOR direto:', (err as Error).message);
     }
   }
 
-  // ── RAPTOR direto origem → destino ───────────────────────────────────────
   try {
     const raptorRoutes = await calculateRoutesRaptor(
       originLat, originLng, destLat, destLng, priority
@@ -607,7 +598,6 @@ export async function calculateRoutes(
     console.warn('[routing] RAPTOR falhou, usando BFS legado:', (err as Error).message);
   }
 
-  // ── BFS legado (garantia de resposta) ────────────────────────────────────
   console.log('[routing] Usando BFS legado');
   const [originStops, destStops] = await Promise.all([
     getNearbyStops(originLat, originLng, false),
@@ -615,7 +605,7 @@ export async function calculateRoutes(
   ]);
 
   if (originStops.length === 0 || destStops.length === 0) {
-    throw new Error('Nenhum ponto de embarque encontrado próximo à origem ou destino.');
+    throw new Error('Nenhum ponto de embarque encontrado proximo a origem ou destino.');
   }
 
   const routes = await bfsRoutes(originStops, destStops, priority);
