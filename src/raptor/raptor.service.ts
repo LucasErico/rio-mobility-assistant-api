@@ -3,59 +3,58 @@ import { getTransitGraph } from './graph-loader';
 import { runRaptor } from './raptor-router';
 import type { RouteOption, RouteLeg, Priority } from './types';
 
-// Tarifa correta 2026 por modal
-const MODAL_FARE: Record<string, number> = {
-  bus:   5.00,
-  metro: 7.90,
-  trem:  7.60,
-  vlt:   5.00,
-  brt:   5.00,
+// Tarifa correta 2026 por modal — fonte unica (importar daqui em outros modulos)
+export const MODAL_FARE: Record<string, number> = {
+  bus:         5.00,
+  bus_express: 23.00, // linhas 2xxx (ex: 2335 Santa Cruz-Castelo)
+  metro:       7.90,
+  trem:        7.60,
+  train:       7.60,  // alias de trem (consistencia com routing.service.ts)
+  vlt:         5.00,
+  brt:         5.00,
 };
 
 // ── Shape para legs de trilho (metro/trem/VLT) ────────────────────────────
-// Usa função SQL get_rail_line_polyline (Fase 4) via virtual_rail_structure
+// FIX-07: a query anterior usava vrs.geom (coluna inexistente) e vrs.rail_route_id
+// (nome errado — coluna real e route_id). Reescrita para usar somente
+// virtual_rail_routes.route_name + virtual_rail_structure.stop_sequence + station_name
+// e chamar get_rail_line_polyline(route_id, seq_from, seq_to) diretamente.
 async function resolveShapeForLeg(
   leg: RouteLeg
 ): Promise<{ lat: number; lng: number }[]> {
 
   if (leg.modal === 'metro' || leg.modal === 'trem' || leg.modal === 'vlt') {
     try {
+      // Busca o route_id e as sequencias de parada mais proximas das coords da leg
+      // Usa station_name para localizar as paradas (virtual_rail_structure nao tem geom)
       const railRes = await pool.query<{
-        rail_route_id: number;
+        route_id: number;
         from_seq: number;
         to_seq: number;
       }>(`
         SELECT
-          vrs_from.rail_route_id,
+          vrr.id            AS route_id,
           vrs_from.stop_sequence AS from_seq,
           vrs_to.stop_sequence   AS to_seq
-        FROM virtual_rail_structure vrs_from
-        JOIN virtual_rail_structure vrs_to
-          ON vrs_to.rail_route_id = vrs_from.rail_route_id
-        JOIN virtual_rail_routes vrr
-          ON vrr.id = vrs_from.rail_route_id
+        FROM virtual_rail_routes vrr
+        JOIN virtual_rail_structure vrs_from ON vrs_from.route_id = vrr.id
+        JOIN virtual_rail_structure vrs_to   ON vrs_to.route_id   = vrr.id
         WHERE vrr.route_name = $1
-          AND ST_DWithin(
-            vrs_from.geom::geography,
-            ST_SetSRID(ST_MakePoint($3,$2),4326)::geography, 400
-          )
-          AND ST_DWithin(
-            vrs_to.geom::geography,
-            ST_SetSRID(ST_MakePoint($5,$4),4326)::geography, 400
-          )
+          AND vrs_from.station_name = $2
+          AND vrs_to.station_name   = $3
         LIMIT 1
       `, [
         leg.route_name,
-        leg.from_coords.lat, leg.from_coords.lng,
-        leg.to_coords.lat,   leg.to_coords.lng,
+        leg.from_stop,
+        leg.to_stop,
       ]);
 
       if (!railRes.rows.length) return [];
-      const { rail_route_id, from_seq, to_seq } = railRes.rows[0];
+      const { route_id, from_seq, to_seq } = railRes.rows[0];
 
       const pts = await pool.query<{ lat: number; lng: number }>(
         `SELECT lat, lng FROM get_rail_line_polyline($1, $2, $3)`,
-        [rail_route_id, from_seq, to_seq]
+        [route_id, from_seq, to_seq]
       );
       return pts.rows.map(r => ({ lat: Number(r.lat), lng: Number(r.lng) }));
     } catch {
@@ -64,7 +63,7 @@ async function resolveShapeForLeg(
   }
 
   // ── Bus/BRT: usa get_precise_trip_polyline (Fase 4) ─────────────────────
-  // ST_MakeLine executado UMA única vez dentro da função SQL
+  // ST_MakeLine executado UMA unica vez dentro da funcao SQL
   try {
     const tripRes = await pool.query<{ shape_id: string | null }>(`
       SELECT DISTINCT t.shape_id
@@ -103,7 +102,7 @@ async function resolveShapeForLeg(
   }
 }
 
-// ── Entry point público ──────────────────────────────────────────────────
+// ── Entry point publico ──────────────────────────────────────────────────
 export async function calculateRoutesRaptor(
   originLat: number, originLng: number,
   destLat:   number, destLng:   number,
