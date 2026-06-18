@@ -1,35 +1,19 @@
 import { pool } from '../db';
 import { getNearbyStops, NearbyStop } from './stops.service';
 import { calculateRoutesRaptor } from '../raptor/raptor.service';
+import { geocodeAddress } from '../utils/geocode';
+import { buildSemanticPlan } from './semantic-planner.service';
+import type { RouteOption, RouteLeg } from '../raptor/types';
 
 export type Priority = 'cheaper' | 'faster' | 'less_transfers';
-
-export interface RouteLeg {
-  modal: string;
-  route_name: string;
-  from_stop: string;
-  to_stop: string;
-  from_coords: { lat: number; lng: number };
-  to_coords: { lat: number; lng: number };
-  shape_coords: { lat: number; lng: number }[];
-  estimated_minutes: number;
-  walk_to_stop_m: number;
-}
-
-export interface RouteOption {
-  legs: RouteLeg[];
-  summary: {
-    total_minutes: number;
-    transfers: number;
-    estimated_cost_brl: number;
-  };
-}
+export type { RouteOption, RouteLeg };
 
 // Tarifas 2026
 const MODAL_FARE: Record<string, number> = {
   bus:   5.00,
   metro: 7.90,
   train: 7.60,
+  trem:  7.60,
   vlt:   5.00,
   brt:   5.00,
 };
@@ -40,6 +24,7 @@ const MODAL_SPEED_M_PER_MIN: Record<string, number> = {
   brt:   450,
   metro: 600,
   train: 550,
+  trem:  550,
   vlt:   300,
 };
 
@@ -47,6 +32,7 @@ const MODAL_SPEED_BONUS: Record<string, number> = {
   brt:   -5,
   metro: -8,
   train: -3,
+  trem:  -3,
   vlt:   -2,
   bus:    0,
 };
@@ -171,7 +157,7 @@ async function getTripsFromStop(
        COALESCE(r.route_short_name, r.route_long_name) AS route_name,
        CASE r.route_type
          WHEN 1   THEN 'metro'
-         WHEN 2   THEN 'train'
+         WHEN 2   THEN 'trem'
          WHEN 0   THEN 'vlt'
          WHEN 700 THEN 'brt'
          WHEN 702 THEN 'bus'
@@ -482,27 +468,146 @@ function sortByPriority(
   });
 }
 
-// ── Entry point público ──────────────────────────────────────────────────────────
-// Tenta RAPTOR primeiro; se falhar (grafo sem cobertura), cai no BFS legado.
-export async function calculateRoutes(
-  originLat: number, originLng: number,
-  destLat:   number, destLng:   number,
-  priority:  Priority
+// ── Camada 3: geocodifica waypoints do plano semântico ───────────────────────
+// Para cada leg do plano semântico, resolve coordenadas do waypoint.
+// Se o waypoint falhar no geocoding, é ignorado silenciosamente (modo degradado
+// para aquele segmento — RAPTOR tentará o segmento maior).
+async function geocodeWaypoints(
+  legs: { waypoint_name: string; modal: string; line_code: string; leg: number }[]
+): Promise<{ name: string; lat: number; lng: number; modal: string; leg: number }[]> {
+  const results = await Promise.allSettled(
+    legs.map(l => geocodeAddress(l.waypoint_name).then(coords => ({
+      name:  l.waypoint_name,
+      lat:   coords.lat,
+      lng:   coords.lng,
+      modal: l.modal,
+      leg:   l.leg,
+    })))
+  );
+
+  const resolved: { name: string; lat: number; lng: number; modal: string; leg: number }[] = [];
+  for (const r of results) {
+    if (r.status === 'fulfilled') {
+      resolved.push(r.value);
+    } else {
+      console.warn('[routing] Waypoint falhou no geocoding, ignorando:', r.reason?.message);
+    }
+  }
+  return resolved;
+}
+
+// ── Roteamento por segmentos via RAPTOR com waypoints ───────────────────────
+// Divide a rota em segmentos entre waypoints consecutivos e roda RAPTOR em
+// cada par em paralelo. Concatena as legs resultantes.
+async function routeWithWaypoints(
+  originLat:  number, originLng:  number,
+  destLat:    number, destLng:    number,
+  waypoints:  { name: string; lat: number; lng: number; modal: string; leg: number }[],
+  priority:   Priority
 ): Promise<RouteOption[]> {
-  // 1. Tenta motor RAPTOR
+  // Monta sequência de pontos: origem → waypoints ordenados → destino
+  const points = [
+    { lat: originLat, lng: originLng },
+    ...waypoints.sort((a, b) => a.leg - b.leg).map(w => ({ lat: w.lat, lng: w.lng })),
+    { lat: destLat,   lng: destLng   },
+  ];
+
+  // Roda RAPTOR em cada par de pontos consecutivos em paralelo
+  const segmentResults = await Promise.allSettled(
+    points.slice(0, -1).map((from, i) =>
+      calculateRoutesRaptor(from.lat, from.lng, points[i + 1].lat, points[i + 1].lng, priority)
+    )
+  );
+
+  // Coleta apenas os segmentos que tiveram sucesso
+  const validSegments: RouteOption[][] = [];
+  for (let i = 0; i < segmentResults.length; i++) {
+    const r = segmentResults[i];
+    if (r.status === 'fulfilled' && r.value.length > 0) {
+      validSegments.push(r.value);
+    } else {
+      console.warn(`[routing] Segmento ${i + 1}/${segmentResults.length} falhou, ignorando.`);
+    }
+  }
+
+  if (validSegments.length === 0) return [];
+
+  // Pega a melhor opção de cada segmento e concatena as legs
+  const mergedLegs: RouteLeg[] = validSegments.map(seg => seg[0].legs).flat();
+  const totalMinutes      = validSegments.reduce((acc, seg) => acc + seg[0].summary.total_minutes, 0);
+  const totalTransfers    = validSegments.reduce((acc, seg) => acc + seg[0].summary.transfers, 0);
+  const totalCost         = mergedLegs.reduce((acc, l) => acc + (MODAL_FARE[l.modal] ?? 5.00), 0);
+
+  return [{
+    legs: mergedLegs,
+    summary: {
+      total_minutes:      totalMinutes,
+      transfers:          totalTransfers,
+      estimated_cost_brl: totalCost,
+    },
+  }];
+}
+
+// ── Entry point público ──────────────────────────────────────────────────────
+// originText / destText são opcionais.
+// Se fornecidos, ativa o pipeline Tribunal de Fontes (Camadas 2+3).
+// Se omitidos, comportamento legado preservado.
+export async function calculateRoutes(
+  originLat:  number, originLng:  number,
+  destLat:    number, destLng:    number,
+  priority:   Priority,
+  originText?: string,
+  destText?:   string
+): Promise<RouteOption[]> {
+
+  // ── Pipeline Tribunal de Fontes (Camadas 2 + 3) ──────────────────────────
+  if (originText && destText) {
+    try {
+      const plan = await buildSemanticPlan(originText, destText);
+
+      if (!plan.degraded && plan.legs.length > 0) {
+        // Camada 3: geocodifica waypoints em paralelo
+        const waypoints = await geocodeWaypoints(plan.legs);
+
+        if (waypoints.length > 0) {
+          console.log(
+            `[routing] Plano semântico com ${waypoints.length} waypoint(s) ` +
+            `(fonte: ${plan.source}, score: ${plan.score}). Roteando por segmentos...`
+          );
+
+          const waypointRoutes = await routeWithWaypoints(
+            originLat, originLng, destLat, destLng, waypoints, priority
+          );
+
+          if (waypointRoutes.length > 0) {
+            console.log('[routing] Rota com waypoints semânticos concluída.');
+            return sortByPriority(waypointRoutes, priority);
+          }
+        }
+
+        console.warn('[routing] Waypoints geocodificados mas RAPTOR por segmento falhou. Caindo para RAPTOR direto.');
+      } else {
+        console.log(`[routing] Plano semântico degradado (score: ${plan.score}). Usando RAPTOR direto.`);
+      }
+    } catch (err) {
+      console.warn('[routing] Tribunal de Fontes falhou, continuando com RAPTOR direto:', (err as Error).message);
+    }
+  }
+
+  // ── RAPTOR direto origem → destino ───────────────────────────────────────
   try {
     const raptorRoutes = await calculateRoutesRaptor(
       originLat, originLng, destLat, destLng, priority
     );
     if (raptorRoutes.length > 0) {
-      console.log(`[routing] RAPTOR retornou ${raptorRoutes.length} rota(s)`);
+      console.log(`[routing] RAPTOR direto retornou ${raptorRoutes.length} rota(s)`);
       return raptorRoutes;
     }
   } catch (err) {
     console.warn('[routing] RAPTOR falhou, usando BFS legado:', (err as Error).message);
   }
 
-  // 2. Fallback: BFS legado (preservado para garantir disponibilidade)
+  // ── BFS legado (garantia de resposta) ────────────────────────────────────
   console.log('[routing] Usando BFS legado');
   const [originStops, destStops] = await Promise.all([
     getNearbyStops(originLat, originLng, false),
@@ -510,17 +615,13 @@ export async function calculateRoutes(
   ]);
 
   if (originStops.length === 0 || destStops.length === 0) {
-    throw new Error(
-      'Nenhum ponto de embarque encontrado próximo à origem ou destino.'
-    );
+    throw new Error('Nenhum ponto de embarque encontrado próximo à origem ou destino.');
   }
 
   const routes = await bfsRoutes(originStops, destStops, priority);
 
   if (routes.length === 0) {
-    throw new Error(
-      'Nenhuma rota encontrada entre os pontos informados.'
-    );
+    throw new Error('Nenhuma rota encontrada entre os pontos informados.');
   }
 
   return sortByPriority(routes, priority).slice(0, 5);
