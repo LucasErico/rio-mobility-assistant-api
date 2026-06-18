@@ -1,13 +1,12 @@
 import { pool } from '../db';
 import { getNearbyStops, NearbyStop } from './stops.service';
-import { calculateRoutesRaptor, MODAL_FARE } from '../raptor/raptor.service'; // FIX-14: fonte unica
+import { calculateRoutesRaptor, MODAL_FARE } from '../raptor/raptor.service';
 import { geocodeAddress } from '../utils/geocode';
-import { buildSemanticPlan } from './semantic-planner.service';
-import type { RouteOption, RouteLeg, Priority } from '../raptor/types'; // FIX-15: importar, nao redeclarar
+import { buildSemanticPlan, resolveStopFromLeg } from './semantic-planner.service';
+import type { RouteOption, RouteLeg, Priority } from '../raptor/types';
 
 export type { RouteOption, RouteLeg, Priority };
 
-// Velocidade media em metros/min por modal
 const MODAL_SPEED_M_PER_MIN: Record<string, number> = {
   bus:         250,
   brt:         450,
@@ -143,8 +142,6 @@ async function getTripsFromStop(
   if (cache.has(cacheKey)) return cache.get(cacheKey)!;
 
   const res = await pool.query(
-    // FIX-06: mapa correto de route_type -> modal (igual ao graph-loader.ts)
-    // 0=VLT, 1=Metro, 2=Trem, 700=bus generico, 702=BRT SPPO, 200=bus_express
     `SELECT
        st1.trip_id,
        COALESCE(r.route_short_name, r.route_long_name) AS route_name,
@@ -233,20 +230,16 @@ async function getNearbyStopsAlongRoute(
 ): Promise<NearbyStop[]> {
   const totalDistM = haversineM(originLat, originLng, destLat, destLng);
 
-  // FIX-11: pontos de amostragem com offset lateral para rotas costeiras
-  // (ex: Recreio->Centro via Niemeyer que a linha reta cruzaria o oceano)
   const fracs = [0.25, 0.50, 0.75];
   const samplePoints = fracs.map(frac => ({
     lat: originLat + frac * (destLat - originLat),
     lng: originLng + frac * (destLng - originLng),
   }));
 
-  // Para rotas longas (>15km), adiciona pontos com desvio lateral de ~2km
-  // para capturar paradas em rotas que contornam obstaculos geograficos
   if (totalDistM > 15000) {
     const dLat = (destLat - originLat);
     const dLng = (destLng - originLng);
-    const perpLat =  dLng * 0.018; // ~2km de desvio lateral
+    const perpLat =  dLng * 0.018;
     const perpLng = -dLat * 0.018;
     samplePoints.push(
       { lat: originLat + 0.5 * dLat + perpLat, lng: originLng + 0.5 * dLng + perpLng },
@@ -368,7 +361,7 @@ async function bfsRoutes(
         const shapeCoords = await getShapeForTrip(
           trip.trip_id, node.stopId, trip.dest_stop_id
         );
-        const fare = MODAL_FARE[trip.modal] ?? MODAL_FARE.bus; // FIX-14: fonte unica
+        const fare = MODAL_FARE[trip.modal] ?? MODAL_FARE.bus;
 
         const leg: RouteLeg = {
           modal:             trip.modal,
@@ -477,17 +470,43 @@ function sortByPriority(
   });
 }
 
+/**
+ * geocodeWaypoints v2:
+ * 1. Tenta resolveStopFromLeg() — encontra o stop real da linha mais próximo
+ *    do waypoint usando known_terminals como âncora. Resultado mais preciso.
+ * 2. Fallback: geocodeAddress() — comportamento anterior (Nominatim/Photon/Groq)
+ *    geocodeAddress() já consulta known_terminals como Camada 0.
+ */
 async function geocodeWaypoints(
   legs: { waypoint_name: string; modal: string; line_code: string; leg: number }[]
 ): Promise<{ name: string; lat: number; lng: number; modal: string; leg: number }[]> {
   const results = await Promise.allSettled(
-    legs.map(l => geocodeAddress(l.waypoint_name).then(coords => ({
-      name:  l.waypoint_name,
-      lat:   coords.lat,
-      lng:   coords.lng,
-      modal: l.modal,
-      leg:   l.leg,
-    })))
+    legs.map(async l => {
+      // Tenta primeiro: stop real da linha no waypoint (resolveStopFromLeg)
+      const resolved = await resolveStopFromLeg(l.line_code, l.waypoint_name);
+      if (resolved) {
+        return {
+          name:  resolved.stop_name,
+          lat:   resolved.lat,
+          lng:   resolved.lng,
+          modal: l.modal,
+          leg:   l.leg,
+        };
+      }
+
+      // Fallback: geocoding genérico (known_terminals → Nominatim → Photon → Groq)
+      console.warn(
+        `[routing] resolveStopFromLeg falhou para "${l.line_code}" @ "${l.waypoint_name}", usando geocodeAddress`
+      );
+      const coords = await geocodeAddress(l.waypoint_name);
+      return {
+        name:  l.waypoint_name,
+        lat:   coords.lat,
+        lng:   coords.lng,
+        modal: l.modal,
+        leg:   l.leg,
+      };
+    })
   );
 
   const resolved: { name: string; lat: number; lng: number; modal: string; leg: number }[] = [];
@@ -495,7 +514,7 @@ async function geocodeWaypoints(
     if (r.status === 'fulfilled') {
       resolved.push(r.value);
     } else {
-      console.warn('[routing] Waypoint falhou no geocoding, ignorando:', r.reason?.message);
+      console.warn('[routing] Waypoint falhou completamente, ignorando:', r.reason?.message);
     }
   }
   return resolved;
@@ -554,6 +573,8 @@ export async function calculateRoutes(
   destText?:   string
 ): Promise<RouteOption[]> {
 
+  // Camada semântica v2: texto puro do usuário → busca web → legs com line_code
+  // → resolveStopFromLeg (stop real) → RAPTOR por segmento curto
   if (originText && destText) {
     try {
       const plan = await buildSemanticPlan(originText, destText);
@@ -563,7 +584,7 @@ export async function calculateRoutes(
 
         if (waypoints.length > 0) {
           console.log(
-            `[routing] Plano semantico com ${waypoints.length} waypoint(s) ` +
+            `[routing] Plano semântico v2: ${waypoints.length} waypoint(s) ` +
             `(fonte: ${plan.source}, score: ${plan.score}). Roteando por segmentos...`
           );
 
@@ -572,20 +593,21 @@ export async function calculateRoutes(
           );
 
           if (waypointRoutes.length > 0) {
-            console.log('[routing] Rota com waypoints semanticos concluida.');
+            console.log('[routing] Rota semântica v2 concluída.');
             return sortByPriority(waypointRoutes, priority);
           }
         }
 
-        console.warn('[routing] Waypoints geocodificados mas RAPTOR por segmento falhou. Caindo para RAPTOR direto.');
+        console.warn('[routing] Waypoints resolvidos mas RAPTOR por segmento falhou. Caindo para RAPTOR direto.');
       } else {
-        console.log(`[routing] Plano semantico degradado (score: ${plan.score}). Usando RAPTOR direto.`);
+        console.log(`[routing] Plano semântico degradado (score: ${plan.score}). Usando RAPTOR direto.`);
       }
     } catch (err) {
-      console.warn('[routing] Tribunal de Fontes falhou, continuando com RAPTOR direto:', (err as Error).message);
+      console.warn('[routing] Camada semântica falhou, continuando com RAPTOR direto:', (err as Error).message);
     }
   }
 
+  // Fallback 1: RAPTOR direto
   try {
     const raptorRoutes = await calculateRoutesRaptor(
       originLat, originLng, destLat, destLng, priority
@@ -598,6 +620,7 @@ export async function calculateRoutes(
     console.warn('[routing] RAPTOR falhou, usando BFS legado:', (err as Error).message);
   }
 
+  // Fallback 2: BFS legado
   console.log('[routing] Usando BFS legado');
   const [originStops, destStops] = await Promise.all([
     getNearbyStops(originLat, originLng, false),
@@ -605,7 +628,7 @@ export async function calculateRoutes(
   ]);
 
   if (originStops.length === 0 || destStops.length === 0) {
-    throw new Error('Nenhum ponto de embarque encontrado proximo a origem ou destino.');
+    throw new Error('Nenhum ponto de embarque encontrado próximo à origem ou destino.');
   }
 
   const routes = await bfsRoutes(originStops, destStops, priority);
