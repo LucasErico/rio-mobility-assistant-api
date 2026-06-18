@@ -1,29 +1,31 @@
 import { pool } from '../db';
 import type { TransitGraph, RaptorStop, RaptorRoute, Footpath } from './types';
 
-// Singleton em memória — carregado uma vez no boot, reutilizado em todas as requests
+// Singleton em memoria — carregado uma vez no boot, reutilizado em todas as requests
 let cachedGraph: TransitGraph | null = null;
 let loadingPromise: Promise<TransitGraph> | null = null;
 
 export async function getTransitGraph(): Promise<TransitGraph> {
   if (cachedGraph) return cachedGraph;
 
-  // Evita carregar em paralelo se múltiplos requests chegarem durante o boot
+  // FIX-13: promise coalescing — evita race condition no boot com requests paralelos
   if (loadingPromise) return loadingPromise;
 
-  loadingPromise = buildGraph();
-  cachedGraph = await loadingPromise;
-  loadingPromise = null;
-  return cachedGraph;
+  loadingPromise = buildGraph().then(g => {
+    cachedGraph     = g;
+    loadingPromise  = null;
+    return g;
+  });
+  return loadingPromise;
 }
 
-// Invalida o cache (útil para testes ou reload manual via endpoint admin)
+// Invalida o cache (util para testes ou reload manual via endpoint admin)
 export function invalidateGraphCache(): void {
   cachedGraph = null;
 }
 
 async function buildGraph(): Promise<TransitGraph> {
-  console.log('[RAPTOR] Carregando grafo em memória...');
+  console.log('[RAPTOR] Carregando grafo em memoria...');
   const t0 = Date.now();
 
   const [stops, routes, footpaths] = await Promise.all([
@@ -32,7 +34,7 @@ async function buildGraph(): Promise<TransitGraph> {
     loadFootpaths(),
   ]);
 
-  // Índice reverso: stop → quais rotas passam por ele
+  // Indice reverso: stop -> quais rotas passam por ele
   const stopRoutes = new Map<string, string[]>();
   for (const [routeId, route] of routes.entries()) {
     for (const stopId of route.stops) {
@@ -55,7 +57,7 @@ async function buildGraph(): Promise<TransitGraph> {
 async function loadStops(): Promise<Map<string, RaptorStop>> {
   const stops = new Map<string, RaptorStop>();
 
-  // Paradas GTFS (bus, brt — estão em gtfs_stops)
+  // Paradas GTFS (bus, brt — estao em gtfs_stops)
   const gtfsRes = await pool.query<{
     stop_id: string; stop_name: string; lat: string; lng: string;
   }>(`
@@ -74,41 +76,50 @@ async function loadStops(): Promise<Map<string, RaptorStop>> {
     });
   }
 
-  // Paradas virtuais (metro/trem/VLT — estão em virtual_rail_structure)
-  // Usamos o station_name como stopId virtual (prefixado para evitar colisão)
+  // FIX-08: paradas virtuais (metro/trem/VLT) buscam coords reais das
+  // tabelas de origem (metro_stations, train_stations, vlt_stops) via
+  // station_ref_id + station_ref_modal. Antes usava transit_hubs (lookup
+  // por nome, impreciso) ou coords hardcoded (Centro fallback).
   const railRes = await pool.query<{
     route_id: number; line_code: string; modal: string;
     stop_sequence: number; station_name: string;
-    station_ref_id: number | null;
+    station_ref_id: number | null; station_ref_modal: string | null;
   }>(`
     SELECT vrs.route_id, vrr.line_code, vrr.modal,
-           vrs.stop_sequence, vrs.station_name, vrs.station_ref_id
+           vrs.stop_sequence, vrs.station_name,
+           vrs.station_ref_id, vrs.station_ref_modal
     FROM public.virtual_rail_structure vrs
     JOIN public.virtual_rail_routes vrr ON vrr.id = vrs.route_id
     ORDER BY vrs.route_id, vrs.stop_sequence
   `);
 
-  // Resolve coords das estações virtuais via transit_hubs (curadoria manual)
-  const hubRes = await pool.query<{
-    name: string; lat: string; lng: string;
-  }>(`
-    SELECT name,
-           ST_Y(geom::geometry)::float AS lat,
-           ST_X(geom::geometry)::float AS lng
-    FROM public.transit_hubs
-  `);
-  const hubCoords = new Map<string, { lat: number; lng: number }>();
-  for (const h of hubRes.rows) {
-    hubCoords.set(h.name.toLowerCase().trim(), {
-      lat: Number(h.lat), lng: Number(h.lng),
-    });
-  }
+  // Carrega coords reais das tres tabelas de estacoes em um unico mapa
+  const stationCoords = new Map<string, { lat: number; lng: number }>();
+
+  const [metroRes, trainRes, vltRes] = await Promise.all([
+    pool.query<{ id: number; lat: string; lng: string }>(
+      `SELECT id, stop_lat::float AS lat, stop_lon::float AS lng FROM public.metro_stations`
+    ),
+    pool.query<{ id: number; lat: string; lng: string }>(
+      `SELECT id, stop_lat::float AS lat, stop_lon::float AS lng FROM public.train_stations`
+    ),
+    pool.query<{ id: number; lat: string; lng: string }>(
+      `SELECT id, stop_lat::float AS lat, stop_lon::float AS lng FROM public.vlt_stops`
+    ),
+  ]);
+  for (const r of metroRes.rows) stationCoords.set(`metro:${r.id}`, { lat: Number(r.lat), lng: Number(r.lng) });
+  for (const r of trainRes.rows) stationCoords.set(`trem:${r.id}`,  { lat: Number(r.lat), lng: Number(r.lng) });
+  for (const r of vltRes.rows)   stationCoords.set(`vlt:${r.id}`,   { lat: Number(r.lat), lng: Number(r.lng) });
 
   for (const row of railRes.rows) {
     const virtualId = `rail:${row.line_code}:${row.stop_sequence}`;
     if (stops.has(virtualId)) continue;
 
-    const coords = hubCoords.get(row.station_name.toLowerCase().trim()) ??
+    // Busca coords da tabela correta via station_ref_id + station_ref_modal
+    const coordKey = row.station_ref_id && row.station_ref_modal
+      ? `${row.station_ref_modal}:${row.station_ref_id}`
+      : null;
+    const coords = (coordKey ? stationCoords.get(coordKey) : null) ??
                    { lat: -22.9035, lng: -43.1731 }; // fallback Centro RJ
 
     stops.set(virtualId, {
@@ -122,11 +133,26 @@ async function loadStops(): Promise<Map<string, RaptorStop>> {
   return stops;
 }
 
-// ── Carrega rotas: GTFS (via adjacency) + virtual rail ────────────────────────
+// ── Carrega rotas: GTFS (via adjacency) + virtual rail ─────────────────────
 async function loadRoutes(): Promise<Map<string, RaptorRoute>> {
   const routes = new Map<string, RaptorRoute>();
 
-  // ── GTFS routes (bus, brt) — via gtfs_route_adjacency ─────────────────────
+  // FIX-10: headways reais do gtfs_frequencies por route_id (mediana pico)
+  // Carregados antes de montar as rotas para usar no fareMap
+  const freqRes = await pool.query<{ route_id: string; avg_headway: string }>(`
+    SELECT t.route_id, ROUND(AVG(f.headway_secs))::text AS avg_headway
+    FROM gtfs_frequencies f
+    JOIN gtfs_trips t ON t.trip_id = f.trip_id
+    WHERE f.start_time >= '06:00:00' AND f.end_time <= '22:00:00'
+    GROUP BY t.route_id
+  `);
+  const headwayByRoute = new Map<string, number>();
+  for (const row of freqRes.rows) {
+    headwayByRoute.set(row.route_id, Number(row.avg_headway));
+  }
+
+  // FIX-01: mapa correto de route_type -> modal
+  // 0=VLT, 1=Metro, 2=Trem, 700=bus generico, 702=BRT SPPO, 200=bus_express
   const adjRes = await pool.query<{
     route_id: string; route_name: string; modal: string;
     from_stop_id: string; to_stop_id: string; stop_sequence: number;
@@ -135,10 +161,12 @@ async function loadRoutes(): Promise<Map<string, RaptorRoute>> {
       ra.route_id,
       COALESCE(r.route_short_name, r.route_long_name) AS route_name,
       CASE r.route_type
+        WHEN 0   THEN 'vlt'
         WHEN 1   THEN 'metro'
         WHEN 2   THEN 'trem'
-        WHEN 0   THEN 'vlt'
-        WHEN 700 THEN 'brt'
+        WHEN 700 THEN 'bus'
+        WHEN 702 THEN 'brt'
+        WHEN 200 THEN 'bus_express'
         ELSE          'bus'
       END AS modal,
       ra.from_stop_id,
@@ -163,8 +191,15 @@ async function loadRoutes(): Promise<Map<string, RaptorRoute>> {
     });
   }
 
+  // FIX-02: fareMap completo incluindo bus_express e train
   const fareMap: Record<string, number> = {
-    metro: 7.90, trem: 7.60, brt: 5.00, vlt: 5.00, bus: 5.00,
+    metro:       7.90,
+    trem:        7.60,
+    train:       7.60,
+    brt:         5.00,
+    vlt:         5.00,
+    bus:         5.00,
+    bus_express: 23.00,
   };
 
   for (const [routeId, data] of routeAdjMap.entries()) {
@@ -174,19 +209,24 @@ async function loadRoutes(): Promise<Map<string, RaptorRoute>> {
       if (stops.length === 0) stops.push(edge.from);
       stops.push(edge.to);
     }
+
+    // FIX-10: usa headway real se disponivel, senso fallback por modal
+    const defaultHeadway = data.modal === 'metro' ? 240 :
+                           data.modal === 'brt'   ? 360 :
+                           data.modal === 'trem'  ? 600 : 720;
+    const headwaySec = headwayByRoute.get(routeId) ?? defaultHeadway;
+
     routes.set(routeId, {
       routeId,
       routeName:  data.name,
       modal:      data.modal,
       stops,
-      headwaySec: data.modal === 'metro' ? 240 :
-                  data.modal === 'brt'   ? 360 :
-                  data.modal === 'trem'  ? 600 : 720,
+      headwaySec,
       faresBrl:   fareMap[data.modal] ?? 5.00,
     });
   }
 
-  // ── Virtual rail routes (metro/trem/VLT) ──────────────────────────────────
+  // ── Virtual rail routes (metro/trem/VLT) ─────────────────────────────
   const railRes = await pool.query<{
     route_id: number; line_code: string; line_name: string; modal: string;
     fare_brl: string; headway_sec: number | null;
@@ -243,22 +283,40 @@ async function loadRoutes(): Promise<Map<string, RaptorRoute>> {
   return routes;
 }
 
-// ── Carrega footpaths (baldeações a pé pré-computadas) ───────────────────────
+// ── Carrega footpaths (baldeacoes a pe pre-computadas) ────────────────────
+// FIX-09: gtfs_transfers_multimodal.from_stop_id contem nomes de estacoes
+// (ex: "Central"), mas o grafo usa IDs virtuais (rail:L2:5).
+// Resolvemos o mapeamento nome->ID via JOIN com virtual_rail_structure.
 async function loadFootpaths(): Promise<Footpath[]> {
   const res = await pool.query<{
-    from_stop_id: string; to_stop_id: string; walk_seconds: number;
+    from_virtual_id: string; to_virtual_id: string; walk_seconds: number;
   }>(`
-    SELECT from_stop_id, to_stop_id, walk_seconds
-    FROM public.gtfs_transfers_multimodal
-    WHERE walk_seconds <= 1800
-    ORDER BY walk_seconds
+    SELECT
+      COALESCE('rail:' || vrr_from.line_code || ':' || vrs_from.stop_sequence,
+               gtm.from_stop_id) AS from_virtual_id,
+      COALESCE('rail:' || vrr_to.line_code   || ':' || vrs_to.stop_sequence,
+               gtm.to_stop_id)   AS to_virtual_id,
+      gtm.walk_seconds
+    FROM public.gtfs_transfers_multimodal gtm
+    -- tenta resolver from_stop_id como nome de estacao virtual
+    LEFT JOIN public.virtual_rail_structure vrs_from
+           ON vrs_from.station_name ILIKE gtm.from_stop_id
+    LEFT JOIN public.virtual_rail_routes vrr_from
+           ON vrr_from.id = vrs_from.route_id
+    -- tenta resolver to_stop_id como nome de estacao virtual
+    LEFT JOIN public.virtual_rail_structure vrs_to
+           ON vrs_to.station_name ILIKE gtm.to_stop_id
+    LEFT JOIN public.virtual_rail_routes vrr_to
+           ON vrr_to.id = vrs_to.route_id
+    WHERE gtm.walk_seconds <= 1800
+    ORDER BY gtm.walk_seconds
   `);
 
-  // Footpaths são bidirecionais
+  // Footpaths sao bidirecionais
   const footpaths: Footpath[] = [];
   for (const row of res.rows) {
-    footpaths.push({ fromStopId: row.from_stop_id, toStopId: row.to_stop_id, walkSec: row.walk_seconds });
-    footpaths.push({ fromStopId: row.to_stop_id, toStopId: row.from_stop_id, walkSec: row.walk_seconds });
+    footpaths.push({ fromStopId: row.from_virtual_id, toStopId: row.to_virtual_id, walkSec: row.walk_seconds });
+    footpaths.push({ fromStopId: row.to_virtual_id, toStopId: row.from_virtual_id, walkSec: row.walk_seconds });
   }
   return footpaths;
 }
